@@ -1,64 +1,34 @@
 """
-poker_env.py — Leduc Hold'em poker environment.
+poker_env.py — Royal Hold'em environment.
 
-Leduc Hold'em is a simplified poker game designed for CFR research.
-It has a small enough state space for CFR to find near-Nash strategies
-in thousands of iterations while capturing the essential strategic
-concepts of real poker: bluffing, semi-bluffing, value betting,
-exploiting position.
-
-Rules:
-  - Deck: 6 cards — J, Q, K in two suits (clubs, spades) = 6 cards total
-  - 2 players, heads-up
-  - 2 betting rounds: preflop (private card) + flop (one community card)
-  - Fixed bet sizes: round 1 = 2 chips, round 2 = 4 chips
-  - Max 2 raises per round
-  - Ante: each player puts in 1 chip before the hand
-
-Hand ranking:
-  - Pair (private card matches community card) > High card
-  - Within same category, higher rank wins
-  - J < Q < K
-
-Why Leduc is the right starting point:
-  - State space: ~936 information sets — manageable for exact CFR
-  - Full Hold'em: ~10^18 information sets — requires abstraction
-  - Leduc captures all strategic concepts: position, bluffing, semi-bluffing
-  - Nash equilibrium is reachable in ~10,000 iterations on a laptop
-  - Well-studied: published Nash equilibrium to compare against
+Royal Hold'em uses a 20-card deck (T, J, Q, K, A in all 4 suits).
+It follows the standard Texas Hold'em progression (Preflop, Flop, Turn, River)
+but with a Fixed Limit betting structure to keep the action space bounded.
 """
 
 import numpy as np
-from itertools import product
 
 # ---------------------------------------------------------------------------
 # Card constants
 # ---------------------------------------------------------------------------
-# Cards: 0=Jc, 1=Qc, 2=Kc, 3=Js, 4=Qs, 5=Ks
-JACK  = 0   # rank
-QUEEN = 1
-KING  = 2
-RANKS = ['J', 'Q', 'K']
-SUITS = ['c', 's']
-N_CARDS = 6   # 2 suits × 3 ranks
+RANKS = ['T', 'J', 'Q', 'K', 'A']
+SUITS = ['c', 'd', 'h', 's']
+N_CARDS = 20
 
 def card_rank(card):
-    return card % 3
+    return card % 5
 
 def card_suit(card):
-    return card // 3
+    return card // 5
 
 def card_str(card):
     return RANKS[card_rank(card)] + SUITS[card_suit(card)]
-
-def rank_str(rank):
-    return RANKS[rank]
 
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
 FOLD  = 0
-CALL  = 1   # also = check when no bet facing
+CALL  = 1   
 RAISE = 2
 ACTION_NAMES = ['Fold', 'Call', 'Raise']
 N_ACTIONS = 3
@@ -67,24 +37,82 @@ N_ACTIONS = 3
 # Game constants
 # ---------------------------------------------------------------------------
 ANTE       = 1
-BET_SIZES  = [2, 4]    # round 1, round 2
-MAX_RAISES = 2
+BET_SIZES  = [2, 2, 4, 4]    # Preflop, Flop, Turn, River
+MAX_RAISES = 4
 
 # ---------------------------------------------------------------------------
-# Leduc Hold'em state
+# Hand Evaluation
 # ---------------------------------------------------------------------------
-class LeducState:
+def evaluate_hand(cards):
     """
-    Complete game state for Leduc Hold'em.
-
-    Information set for player p:
-      private_card | community_card (or 'none') | betting_history
-
-    Example: "Qc|Kc|crrc" means:
-      - Private card: Queen of clubs
-      - Community: King of clubs
-      - History: check, raise, raise, call
+    Evaluates 5-card poker hand from up to 7 cards for Royal Hold'em.
+    Returns a tuple score for easy comparison.
+    Since deck is only T-A:
+    - Every Flush is a Royal Flush (T-A of same suit).
+    - Every Straight is T-A.
     """
+    ranks = [c % 5 for c in cards]
+    suits = [c // 5 for c in cards]
+    
+    rank_counts = [0] * 5
+    suit_counts = [0] * 4
+    for r, s in zip(ranks, suits):
+        rank_counts[r] += 1
+        suit_counts[s] += 1
+        
+    # 1. Royal Flush
+    for s in range(4):
+        if suit_counts[s] >= 5:
+            return (8,)
+            
+    # 2. Four of a Kind
+    for r in range(4, -1, -1):
+        if rank_counts[r] >= 4:
+            kicker = max([x for x in ranks if x != r])
+            return (7, r, kicker)
+            
+    # 3. Full House
+    trips = [r for r in range(4, -1, -1) if rank_counts[r] >= 3]
+    pairs = [r for r in range(4, -1, -1) if rank_counts[r] >= 2]
+    
+    if len(trips) >= 2:
+        return (6, trips[0], trips[1])
+    elif len(trips) == 1:
+        valid_pairs = [p for p in pairs if p != trips[0]]
+        if valid_pairs:
+            return (6, trips[0], valid_pairs[0])
+            
+    # 4. Straight
+    if all(c > 0 for c in rank_counts):
+        return (5,)
+        
+    # 5. Three of a Kind
+    if len(trips) == 1:
+        kickers = sorted([x for x in ranks if x != trips[0]], reverse=True)[:2]
+        return (4, trips[0], kickers[0], kickers[1])
+        
+    # 6. Two Pair
+    if len(pairs) >= 2:
+        kickers = sorted([x for x in ranks if x not in (pairs[0], pairs[1])], reverse=True)[:1]
+        kicker = kickers[0] if kickers else -1
+        return (3, pairs[0], pairs[1], kicker)
+        
+    # 7. Pair
+    if len(pairs) == 1:
+        kickers = sorted([x for x in ranks if x != pairs[0]], reverse=True)[:3]
+        while len(kickers) < 3: kickers.append(-1)
+        return (2, pairs[0], kickers[0], kickers[1], kickers[2])
+        
+    # 8. High Card
+    kickers = sorted(ranks, reverse=True)[:5]
+    while len(kickers) < 5: kickers.append(-1)
+    return (1, kickers[0], kickers[1], kickers[2], kickers[3], kickers[4])
+
+# ---------------------------------------------------------------------------
+# Royal Hold'em state
+# ---------------------------------------------------------------------------
+class RoyalState:
+    """Complete game state for Royal Hold'em."""
 
     def __init__(self):
         self.reset()
@@ -94,38 +122,30 @@ class LeducState:
         deck = list(range(N_CARDS))
         rng.shuffle(deck)
 
-        self.private    = [deck[0], deck[1]]   # private cards
-        self.community  = deck[2]              # community (revealed round 2)
+        self.private    = [deck[0:2], deck[2:4]]
+        self.community  = deck[4:9]
 
-        self.round      = 0       # 0 = preflop, 1 = flop
+        self.round      = 0       # 0=Preflop, 1=Flop, 2=Turn, 3=River
         self.pot        = ANTE * 2
-        self.stacks     = [10 - ANTE, 10 - ANTE]
-        self.bets       = [ANTE, ANTE]         # preflop both put in ante
-        self.to_act     = 0
+        self.stacks     = [100 - ANTE, 100 - ANTE] # Increased starting stacks for 4 rounds
+        self.bets       = [ANTE, ANTE]
+        self.to_act     = 0       # P0 acts first preflop (small blind position usually, but heads up preflop P0 acts first)
         self.raises     = 0
         self.done       = False
         self.winner     = None
-        self.history    = []      # list of action chars for info set string
-        self.n_acted    = 0       # actions taken this round
+        self.history    = []
+        self.n_acted    = 0
         return self
 
     @property
     def visible_community(self):
-        return self.community if self.round == 1 else None
-
-    def info_set(self, player):
-        """
-        What player p can observe — used as CFR strategy key.
-        Format: private_card | community_or_none | action_history
-        """
-        priv   = card_str(self.private[player])
-        comm   = card_str(self.community) if self.round == 1 else 'none'
-        hist   = ''.join('f' if a==FOLD else 'c' if a==CALL else 'r'
-                         for a in self.history)
-        return f'P{player}|{priv}|{comm}|{hist}'
+        if self.round == 0: return []
+        if self.round == 1: return self.community[0:3]
+        if self.round == 2: return self.community[0:4]
+        return self.community[0:5]
 
     def legal_actions(self):
-        if self.done or self.round > 1:
+        if self.done:
             return []
         actions = [FOLD, CALL]
         if (self.raises < MAX_RAISES and
@@ -152,7 +172,6 @@ class LeducState:
             return self
 
         elif action == CALL:
-            # Match opponent's bet
             call_amt = self.bets[opponent] - self.bets[player]
             call_amt = min(call_amt, self.stacks[player])
             self.stacks[player] -= call_amt
@@ -161,7 +180,7 @@ class LeducState:
 
             if self._round_over():
                 self._advance_round()
-                return self   # _advance_round sets to_act — don't overwrite
+                return self
 
         elif action == RAISE:
             call_amt  = self.bets[opponent] - self.bets[player]
@@ -184,57 +203,35 @@ class LeducState:
         self.raises  = 0
         self.n_acted = 0
 
-        if self.round > 1:
+        if self.round > 3:
             # Showdown
             self.done   = True
             self.winner = self._showdown_winner()
             if self.winner == -1:
-                # Tie — split pot
                 half = self.pot // 2
                 self.stacks[0] += half
                 self.stacks[1] += self.pot - half
             else:
                 self.stacks[self.winner] += self.pot
-            self.pot = 0   # pot distributed
+            self.pot = 0
         else:
-            self.to_act = 1   # P1 acts first post-flop (position)
+            self.to_act = 1   # P1 acts first post-flop (out of position)
 
     def _showdown_winner(self):
-        """
-        Pair > high card. Higher rank wins within category.
-        Returns 0, 1, or -1 (tie).
-        """
-        def hand_val(player):
-            priv = card_rank(self.private[player])
-            comm = card_rank(self.community)
-            if priv == comm:
-                return (1, priv)   # pair
-            return (0, priv)       # high card
-
-        v0, v1 = hand_val(0), hand_val(1)
+        v0 = evaluate_hand(self.private[0] + self.community)
+        v1 = evaluate_hand(self.private[1] + self.community)
         if v0 > v1: return 0
         if v1 > v0: return 1
         return -1
 
     def payoff(self, player):
         assert self.done
-        # Net chips: current stack minus starting stack (10 - ante already paid)
-        # Total chips in game = 20 always. Winner gets pot, loser loses investment.
-        # Simpler: track as (chips_won - chips_invested)
-        # chips_invested = starting_stack(9) - current_stack + pot_share
-        # But easiest: just use zero-sum property
-        # P0_payoff = -P1_payoff, and we know total pot distributed
-        # Use: payoff = final_stack - starting_stack_before_ante
-        # starting stack before ante = 10
-        return self.stacks[player] - 10
+        return self.stacks[player] - 100
 
     def copy(self):
-        """Fast copy — manually copy only mutable fields."""
-        s = LeducState.__new__(LeducState)
-        s.rows      = None  # not used in Leduc
-        s.cols      = None
-        s.private   = list(self.private)
-        s.community = self.community
+        s = RoyalState.__new__(RoyalState)
+        s.private   = [list(self.private[0]), list(self.private[1])]
+        s.community = list(self.community)
         s.round     = self.round
         s.pot       = self.pot
         s.stacks    = list(self.stacks)
@@ -248,35 +245,48 @@ class LeducState:
         return s
 
     def __str__(self):
-        comm = card_str(self.community) if self.round==1 else '?'
-        return (f"Round {self.round} | Pot {self.pot} | "
-                f"P{self.to_act} to act\n"
-                f"  P0: {card_str(self.private[0])}  "
-                f"stack={self.stacks[0]}  bet={self.bets[0]}\n"
-                f"  P1: {card_str(self.private[1])}  "
-                f"stack={self.stacks[1]}  bet={self.bets[1]}\n"
-                f"  Community: {comm}  "
-                f"History: {''.join(str(a) for a in self.history)}")
-
+        comm = ' '.join(card_str(c) for c in self.visible_community) if self.visible_community else 'None'
+        return (f"Round {self.round} | Pot {self.pot} | P{self.to_act} to act\n"
+                f"  P0: {' '.join(card_str(c) for c in self.private[0])}  stack={self.stacks[0]}  bet={self.bets[0]}\n"
+                f"  P1: {' '.join(card_str(c) for c in self.private[1])}  stack={self.stacks[1]}  bet={self.bets[1]}\n"
+                f"  Community: {comm}\n"
+                f"  History: {''.join(str(a) for a in self.history)}")
 
 if __name__ == '__main__':
-    print("=== Leduc Hold'em Environment ===\n")
-    print("Cards:", [card_str(i) for i in range(N_CARDS)])
-
-    s = LeducState().reset(42)
+    print("=== Royal Hold'em Environment ===")
+    s = RoyalState().reset(42)
     print(f"\nDealt hand:\n{s}")
-    print(f"\nP0 info set: {s.info_set(0)}")
-    print(f"P1 info set: {s.info_set(1)}")
-
-    # Play a hand
-    print("\nPlaying: P0 raises, P1 calls → flop → P1 bets, P0 calls")
+    
+    # Preflop
     s.apply_action(RAISE)
     s.apply_action(CALL)
-    print(f"After preflop:\n{s}")
-
+    print(f"\nFlop:\n{s}")
+    
+    # Flop
+    s.apply_action(CALL)
+    s.apply_action(CALL)
+    print(f"\nTurn:\n{s}")
+    
+    # Turn
+    s.apply_action(RAISE)
     s.apply_action(RAISE)
     s.apply_action(CALL)
+    print(f"\nRiver:\n{s}")
+    
+    # River
+    s.apply_action(RAISE)
+    s.apply_action(CALL)
+    print(f"\nShowdown:\n{s}")
     print(f"Result: winner={s.winner}")
-    print(f"P0: {s.payoff(0):+d}  P1: {s.payoff(1):+d}")
-    assert s.payoff(0) + s.payoff(1) == 0, "Zero-sum check failed"
-    print("\n✓ Environment OK")
+    print(f"P0 Payoff: {s.payoff(0):+d}  P1 Payoff: {s.payoff(1):+d}")
+    
+    print("\nEvaluating explicit hand: Quad Aces vs Royal Flush")
+    # Quads: Ac, Ad, Ah, As + Kc, Kh, Ks
+    # Cards of rank A(4): 4, 9, 14, 19
+    # Cards of rank K(3): 3, 8, 13, 18
+    quads = evaluate_hand([4, 9, 14, 19, 3, 8, 13])
+    # Royal Flush of diamonds (suit 1, so cards 5, 6, 7, 8, 9)
+    royal = evaluate_hand([5, 6, 7, 8, 9, 0, 1])
+    print("Quads score:", quads)
+    print("Royal score:", royal)
+    assert royal > quads, "Royal flush should beat quads!"
