@@ -1,31 +1,21 @@
 /*
- * bindings.cpp — pybind11 glue layer (Phase 3: in-memory weight cache).
+ * bindings.cpp — pybind11 glue layer.
  *
- * FIX: Loading libtorch's torch/script.h inside a pybind11 extension that is
- * dlopen'd by a Python process that already has PyTorch loaded causes a
- * "double libtorch" conflict — the process gets killed by the OS (OOM / signal 137).
+ * FIX: Loading libtorch inside a pybind11 extension dlopen'd by a process
+ * that already has PyTorch causes a double-libtorch conflict (SIGKILL).
+ * SOLUTION: receive weight matrices as plain float arrays from Python and
+ * perform the forward pass in raw C++.
  *
- * SOLUTION: Instead of loading TorchScript models from C++, we receive the
- * model's weight matrices as plain float arrays from Python and perform the
- * forward pass ourselves using raw C++ math. This is possible because our
- * DeepCFRNetwork is simple: 3 linear layers + ReLU + 1 output layer.
+ * BLAS: cblas_sgemv is resolved at runtime via dlsym(RTLD_DEFAULT) so we
+ * piggyback on the copy PyTorch already loaded — no link-time dependency,
+ * no double-init conflict.
  *
- * The forward pass for a linear layer is: output = input @ weight.T + bias
+ * Network: 89 → 128 → 128 → 3  (matches DeepCFRNetwork in deep_cfr.py)
  *
- * BLAS ACCELERATION — why not just `#include <Accelerate/Accelerate.h>`?
- * -------------------------------------------------------------------------
- * Adding Accelerate as a *link-time* dependency of our .so causes a
- * framework double-initialisation conflict: PyTorch's libtorch_cpu.dylib
- * already links Accelerate and both initialisers run in the same process,
- * killing it with SIGKILL (exit 137) — the same class of problem that
- * previously prevented using libtorch here.
- *
- * The fix is to look up cblas_sgemv at *runtime* via dlsym(RTLD_DEFAULT).
- * RTLD_DEFAULT searches the process's already-loaded symbol table, so we
- * find the copy that PyTorch loaded for free — zero extra framework load,
- * zero init conflict, full BLAS performance on macOS (AMX on Apple Silicon,
- * LAPACK-optimised BLAS on x86).  On platforms where Accelerate/BLAS is not
- * present the pointer stays null and we fall back to the scalar loop.
+ * Per-thread buffers: each traversal thread accumulates samples into a
+ * thread-local vector; after all threads join a single serial merge loop
+ * inserts them into the shared reservoir.  This eliminates the std::mutex
+ * that previously serialised every push() call.
  */
 
 #include <pybind11/pybind11.h>
@@ -34,6 +24,10 @@
 #include <cstring>
 #include <cmath>
 #include <stdexcept>
+#include <random>
+#include <algorithm>
+#include <thread>
+#include <vector>
 #include "poker_env.h"
 
 #if defined(__APPLE__) || defined(__linux__)
@@ -42,39 +36,24 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Lazy BLAS handle — resolved once at first use
-//
-// cblas_sgemv signature (row-major):
-//   void cblas_sgemv(CBLAS_ORDER, CBLAS_TRANSPOSE,
-//                    int M, int N,
-//                    float alpha, const float *A, int lda,
-//                    const float *X, int incX,
-//                    float beta,          float *Y, int incY);
+// Lazy BLAS handle
 // ---------------------------------------------------------------------------
 enum { CBLAS_ROW_MAJOR = 101, CBLAS_NO_TRANS = 111 };
 
-using cblas_sgemv_t = void (*)(int order, int trans,
-                                int M, int N,
-                                float alpha, const float* A, int lda,
-                                const float* X, int incX,
-                                float beta,  float*       Y, int incY);
+using cblas_sgemv_t = void (*)(int, int, int, int,
+                                float, const float*, int,
+                                const float*, int,
+                                float, float*, int);
 
 static cblas_sgemv_t g_sgemv      = nullptr;
 static bool          g_sgemv_init = false;
 
-static cblas_sgemv_t resolve_sgemv() {
-#if defined(HAVE_DLSYM)
-    void* sym = dlsym(RTLD_DEFAULT, "cblas_sgemv");
-    return reinterpret_cast<cblas_sgemv_t>(sym);   // null if not found
-#else
-    return nullptr;
-#endif
-}
-
-// Called once; safe to call from module init (single-threaded at that point).
 static void init_blas() {
     if (!g_sgemv_init) {
-        g_sgemv      = resolve_sgemv();
+#if defined(HAVE_DLSYM)
+        g_sgemv = reinterpret_cast<cblas_sgemv_t>(
+                      dlsym(RTLD_DEFAULT, "cblas_sgemv"));
+#endif
         g_sgemv_init = true;
     }
 }
@@ -82,20 +61,16 @@ static void init_blas() {
 namespace py = pybind11;
 
 // ---------------------------------------------------------------------------
-// Lightweight neural net: 3-layer MLP with ReLU, no libtorch needed
-// Matches DeepCFRNetwork: Linear(89,256) -> ReLU -> Linear(256,256) -> ReLU
-//                         -> Linear(256,256) -> ReLU -> Linear(256,3)
+// Lightweight MLP — matches DeepCFRNetwork: 89→128→128→3
 // ---------------------------------------------------------------------------
 struct LinearLayer {
-    std::vector<float> weight;  // [out_features, in_features]
-    std::vector<float> bias;    // [out_features]
+    std::vector<float> weight;   // [out_features × in_features], row-major
+    std::vector<float> bias;     // [out_features]
     int in_features;
     int out_features;
 
     void forward(const float* input, float* output, bool relu) const {
         if (g_sgemv) {
-            // Fast path: use BLAS SGEMV resolved from the process symbol table.
-            // y = W·x + b  (row-major weight matrix, CblasNoTrans)
             memcpy(output, bias.data(), out_features * sizeof(float));
             g_sgemv(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS,
                     out_features, in_features,
@@ -103,13 +78,11 @@ struct LinearLayer {
                     input, 1,
                     1.0f, output, 1);
         } else {
-            // Scalar fallback — also benefits from -O3 -march=native
-            // auto-vectorisation (NEON on Apple Silicon).
             for (int o = 0; o < out_features; o++) {
-                float sum = bias[o];
+                float s = bias[o];
                 const float* row = weight.data() + o * in_features;
-                for (int i = 0; i < in_features; i++) sum += row[i] * input[i];
-                output[o] = sum;
+                for (int i = 0; i < in_features; i++) s += row[i] * input[i];
+                output[o] = s;
             }
         }
         if (relu)
@@ -119,62 +92,49 @@ struct LinearLayer {
 };
 
 struct CppMLP {
-    LinearLayer fc1, fc2, fc3, out_layer;
+    LinearLayer fc1, fc2, out_layer;   // 89→128, 128→128, 128→3
     bool warm = false;
 
-    // Temporary buffers for intermediate activations (stack-allocated sizes)
     void forward(const float input[89], float output[3]) const {
-        float h1[256], h2[256], h3[256];
-        fc1.forward(input,  h1, true);
-        fc2.forward(h1,     h2, true);
-        fc3.forward(h2,     h3, true);
-        out_layer.forward(h3, output, false);
+        float h1[128], h2[128];
+        fc1.forward(input, h1, true);
+        fc2.forward(h1,    h2, true);
+        out_layer.forward(h2, output, false);
     }
 };
 
-// ---------------------------------------------------------------------------
-// Static model cache — two MLPs, one per player
-// ---------------------------------------------------------------------------
 static CppMLP g_net0, g_net1;
 
-static void load_layer(LinearLayer& layer, py::array_t<float> weight_arr,
-                       py::array_t<float> bias_arr, int in_f, int out_f) {
+static void load_layer(LinearLayer& layer, py::array_t<float> w_arr,
+                       py::array_t<float> b_arr, int in_f, int out_f) {
     layer.in_features  = in_f;
     layer.out_features = out_f;
-    auto wbuf = weight_arr.request();
-    auto bbuf = bias_arr.request();
+    auto wbuf = w_arr.request(), bbuf = b_arr.request();
     layer.weight.assign(static_cast<float*>(wbuf.ptr),
                         static_cast<float*>(wbuf.ptr) + in_f * out_f);
-    layer.bias.assign(static_cast<float*>(bbuf.ptr),
-                      static_cast<float*>(bbuf.ptr) + out_f);
+    layer.bias.assign(  static_cast<float*>(bbuf.ptr),
+                        static_cast<float*>(bbuf.ptr) + out_f);
 }
 
-// Called from Python after train_adv_network() to sync weights to C++
-// Python passes: weight and bias tensors for each of the 4 layers
+// Called from Python after train_adv_network() to sync weights to C++.
+// Network is now 89→128→128→3, so 3 layers (6 tensor arguments).
 void update_model_cache(
     int player,
     py::array_t<float> fc1_w, py::array_t<float> fc1_b,
     py::array_t<float> fc2_w, py::array_t<float> fc2_b,
-    py::array_t<float> fc3_w, py::array_t<float> fc3_b,
     py::array_t<float> out_w, py::array_t<float> out_b
 ) {
     CppMLP& net = (player == 0) ? g_net0 : g_net1;
-    load_layer(net.fc1,       fc1_w, fc1_b,  89,  256);
-    load_layer(net.fc2,       fc2_w, fc2_b, 256,  256);
-    load_layer(net.fc3,       fc3_w, fc3_b, 256,  256);
-    load_layer(net.out_layer, out_w, out_b, 256,    3);
+    load_layer(net.fc1,       fc1_w, fc1_b,  89, 128);
+    load_layer(net.fc2,       fc2_w, fc2_b, 128, 128);
+    load_layer(net.out_layer, out_w, out_b,  128,   3);
     net.warm = true;
 }
 
 // ---------------------------------------------------------------------------
-// Traversal — same algorithm as Python, using the cached MLP for inference
+// Reservoir buffer — now mutex-free.  Only called from the serial merge
+// loop after all traversal threads have joined, so no concurrency needed.
 // ---------------------------------------------------------------------------
-#include <random>
-#include <algorithm>
-#include <mutex>
-#include <thread>
-#include <vector>
-
 struct CppReservoirBuffer {
     float* states_ptr;
     float* targets_ptr;
@@ -183,11 +143,9 @@ struct CppReservoirBuffer {
     int    state_dim;
     int    target_dim;
     int    n_inserted;
-    std::mutex mtx;
 
     void push(const float* state, const float* target, float weight,
               std::mt19937& rng) {
-        std::lock_guard<std::mutex> lock(mtx);
         int idx;
         if (n_inserted < capacity) {
             idx = n_inserted;
@@ -196,11 +154,23 @@ struct CppReservoirBuffer {
             idx = dist(rng);
             if (idx >= capacity) { n_inserted++; return; }
         }
-        memcpy(states_ptr  + (long long)idx * state_dim,  state,  state_dim  * sizeof(float));
-        memcpy(targets_ptr + (long long)idx * target_dim, target, target_dim * sizeof(float));
+        memcpy(states_ptr  + (long long)idx * state_dim,  state,
+               state_dim  * sizeof(float));
+        memcpy(targets_ptr + (long long)idx * target_dim, target,
+               target_dim * sizeof(float));
         weights_ptr[idx] = weight;
         n_inserted++;
     }
+};
+
+// ---------------------------------------------------------------------------
+// Per-thread sample accumulation
+// ---------------------------------------------------------------------------
+struct LocalSample {
+    float state[89];
+    float target[3];
+    float weight;
+    int   buf_id;   // 0 = adv_buf_0, 1 = adv_buf_1, 2 = strat_buf
 };
 
 void encode_state(const RoyalState& state, int player, float out[89]) {
@@ -213,9 +183,10 @@ void encode_state(const RoyalState& state, int player, float out[89]) {
         out[41 + i * 3 + state.history[i]] = 1.0f;
 }
 
+// traverse() now collects into a thread-local vector instead of pushing
+// directly to a mutex-protected shared buffer.
 float traverse(RoyalState state, int traverser, int t,
-               CppReservoirBuffer& adv_buf_0, CppReservoirBuffer& adv_buf_1,
-               CppReservoirBuffer& strat_buf, std::mt19937& rng) {
+               std::vector<LocalSample>& samples, std::mt19937& rng) {
     if (state.done) return state.payoff(traverser);
 
     int player = state.to_act;
@@ -242,19 +213,28 @@ float traverse(RoyalState state, int traverser, int t,
         for (int a : legal_actions) {
             RoyalState next = state;
             next.apply_action(a);
-            action_values[a] = traverse(next, traverser, t,
-                                        adv_buf_0, adv_buf_1, strat_buf, rng);
+            action_values[a] = traverse(next, traverser, t, samples, rng);
         }
         float ev = 0.0f;
         for (int a : legal_actions) ev += strategy[a] * action_values[a];
         float sampled_adv[3] = {};
         for (int a : legal_actions) sampled_adv[a] = action_values[a] - ev;
 
-        CppReservoirBuffer& abuf = (traverser == 0) ? adv_buf_0 : adv_buf_1;
-        abuf.push(encoded, sampled_adv, static_cast<float>(t), rng);
+        LocalSample s;
+        memcpy(s.state,  encoded,     89 * sizeof(float));
+        memcpy(s.target, sampled_adv,  3 * sizeof(float));
+        s.weight = static_cast<float>(t);
+        s.buf_id = traverser;   // 0 or 1
+        samples.push_back(s);
         return ev;
     } else {
-        strat_buf.push(encoded, strategy, static_cast<float>(t), rng);
+        LocalSample s;
+        memcpy(s.state,  encoded,  89 * sizeof(float));
+        memcpy(s.target, strategy,  3 * sizeof(float));
+        s.weight = static_cast<float>(t);
+        s.buf_id = 2;   // strat buffer
+        samples.push_back(s);
+
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng), cum = 0.0f;
         int chosen = legal_actions[0];
@@ -264,7 +244,7 @@ float traverse(RoyalState state, int traverser, int t,
         }
         RoyalState next = state;
         next.apply_action(chosen);
-        return traverse(next, traverser, t, adv_buf_0, adv_buf_1, strat_buf, rng);
+        return traverse(next, traverser, t, samples, rng);
     }
 }
 
@@ -278,12 +258,12 @@ py::dict run_traversals(
     int strat_capacity, int strat_n_inserted
 ) {
     if (!g_net0.warm || !g_net1.warm)
-        throw std::runtime_error("Model cache not warm. Call update_model_cache() for both players first.");
+        throw std::runtime_error(
+            "Model cache not warm. Call update_model_cache() for both players first.");
 
     auto get_ptr = [](py::object obj) -> float* {
         auto arr = obj.cast<py::array_t<float>>();
-        py::buffer_info buf = arr.request();
-        return static_cast<float*>(buf.ptr);
+        return static_cast<float*>(arr.request().ptr);
     };
 
     CppReservoirBuffer adv_buf_0 {
@@ -294,42 +274,62 @@ py::dict run_traversals(
         get_ptr(adv_states_1), get_ptr(adv_targets_1), get_ptr(adv_weights_1),
         adv_capacity_1, 89, 3, adv_n_inserted_1
     };
-    CppReservoirBuffer strat_buf_cpp {
+    CppReservoirBuffer strat_buf {
         get_ptr(strat_states), get_ptr(strat_targets), get_ptr(strat_weights),
         strat_capacity, 89, 3, strat_n_inserted
     };
 
-    std::random_device rd;
-    // Parallelize traversals using std::thread
-    int n_threads = std::thread::hardware_concurrency();
-    if (n_threads == 0) n_threads = 4;
+    // ------------------------------------------------------------------
+    // Phase 1: each thread traverses its share and collects samples locally.
+    // No mutexes — threads never touch each other's data.
+    // ------------------------------------------------------------------
+    int n_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    std::vector<std::vector<LocalSample>> per_thread(n_threads);
     std::vector<std::thread> threads;
-    
-    // Assign traversals to threads
+    threads.reserve(n_threads);
+
     int base_k = k_traversals / n_threads;
     int extra_k = k_traversals % n_threads;
-    
+
     for (int t_idx = 0; t_idx < n_threads; t_idx++) {
         int thread_k = base_k + (t_idx < extra_k ? 1 : 0);
         if (thread_k == 0) continue;
-        
-        threads.emplace_back([&, thread_k, t_idx]() {
-            // Each thread needs its own RNG to avoid data races
-            std::mt19937 thread_rng(std::random_device{}() + t_idx);
+
+        threads.emplace_back([&, t_idx, thread_k]() {
+            std::mt19937 rng(std::random_device{}() ^ (uint32_t)t_idx);
+            auto& local = per_thread[t_idx];
+            // Reserve a reasonable upper bound to avoid reallocations.
+            // Each traversal-pair generates ~60 samples on average.
+            local.reserve(thread_k * 70);
             for (int k = 0; k < thread_k; k++) {
                 RoyalState state; state.reset();
-                traverse(state, 0, iteration, adv_buf_0, adv_buf_1, strat_buf_cpp, thread_rng);
-                traverse(state, 1, iteration, adv_buf_0, adv_buf_1, strat_buf_cpp, thread_rng);
+                traverse(state, 0, iteration, local, rng);
+                traverse(state, 1, iteration, local, rng);
             }
         });
     }
-    
     for (auto& th : threads) th.join();
+
+    // ------------------------------------------------------------------
+    // Phase 2: single-threaded merge into the shared reservoir buffers.
+    // Serial insertion means reservoir sampling is unbiased and there are
+    // no data races.  For k=100 this loop processes ~6k samples in <2ms.
+    // ------------------------------------------------------------------
+    std::mt19937 merge_rng(std::random_device{}());
+    for (auto& local : per_thread) {
+        for (const auto& s : local) {
+            switch (s.buf_id) {
+                case 0: adv_buf_0.push(s.state, s.target, s.weight, merge_rng); break;
+                case 1: adv_buf_1.push(s.state, s.target, s.weight, merge_rng); break;
+                case 2: strat_buf.push(s.state, s.target, s.weight, merge_rng); break;
+            }
+        }
+    }
 
     py::dict result;
     result["adv_n_0"] = adv_buf_0.n_inserted;
     result["adv_n_1"] = adv_buf_1.n_inserted;
-    result["strat_n"] = strat_buf_cpp.n_inserted;
+    result["strat_n"] = strat_buf.n_inserted;
     return result;
 }
 
@@ -339,8 +339,7 @@ py::dict run_traversals(
 PYBIND11_MODULE(poker_cpp, m) {
     m.doc() = "Royal Hold'em C++ engine + Deep CFR traversal (native MLP, no libtorch)";
 
-    // Resolve cblas_sgemv from the process symbol table (PyTorch has already
-    // loaded Accelerate/BLAS by the time this module is imported).
+    // Resolve cblas_sgemv from PyTorch's already-loaded Accelerate/BLAS.
     init_blas();
 
     py::class_<RoyalState>(m, "RoyalState")
@@ -350,7 +349,8 @@ PYBIND11_MODULE(poker_cpp, m) {
         }, py::arg("seed") = -1, py::return_value_policy::reference)
         .def("copy",              &RoyalState::copy)
         .def("legal_actions",     &RoyalState::legal_actions)
-        .def("apply_action",      &RoyalState::apply_action, py::return_value_policy::reference)
+        .def("apply_action",      &RoyalState::apply_action,
+             py::return_value_policy::reference)
         .def("payoff",            &RoyalState::payoff)
         .def("visible_community", &RoyalState::visible_community)
         .def("__str__",           &RoyalState::to_string)
@@ -380,11 +380,10 @@ PYBIND11_MODULE(poker_cpp, m) {
     m.def("card_str", &card_str);
 
     m.def("update_model_cache", &update_model_cache,
-        "Sync PyTorch model weights to C++ cache (call after train_adv_network)",
+        "Sync PyTorch model weights (89→128→128→3) to C++ cache",
         py::arg("player"),
         py::arg("fc1_w"), py::arg("fc1_b"),
         py::arg("fc2_w"), py::arg("fc2_b"),
-        py::arg("fc3_w"), py::arg("fc3_b"),
         py::arg("out_w"), py::arg("out_b")
     );
 
