@@ -1,2 +1,21 @@
+# Python cache
 __pycache__/
+*.pyc
+
+# PyTorch checkpoints
+*.pt
+*.pth
 checkpoint.pt
+
+# C++ Build artifacts
+build/
+*.so
+*.dylib
+*.o
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/

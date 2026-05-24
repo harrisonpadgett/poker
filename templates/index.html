@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deep CFR vs Human</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container modern-ui">
+        <header>
+            <h1>Royal Hold'em AI</h1>
+            <button id="start-btn" class="btn primary glowing-hover">New Game</button>
+        </header>
+        
+        <div id="game-board" class="hidden">
+            
+            <!-- Top: AI Opponent -->
+            <div class="player-zone ai-zone panel">
+                <div class="player-info">
+                    <span class="player-name">AI Opponent</span>
+                    <span class="chip-stack">Stack: <span id="ai-stack">0</span></span>
+                    <span class="current-bet">Bet: <span id="ai-bet">0</span></span>
+                </div>
+                <div id="ai-cards" class="cards-container">
+                    <!-- Cards will be injected here -->
+                </div>
+            </div>
+            
+            <!-- Middle: Table Area -->
+            <div class="table-zone panel highlight">
+                <div class="table-info">
+                    <div class="pot">Pot: <span id="pot-amount">0</span></div>
+                    <div class="round"><span id="round-state">Preflop</span></div>
+                </div>
+                <div class="winner hidden" id="winner-banner"><span id="winner-text"></span></div>
+                
+                <div id="community-cards" class="cards-container">
+                    <!-- Community cards will be injected here -->
+                </div>
+                
+                <div class="action-history" id="history-log">
+                    <!-- Text log of actions -->
+                </div>
+            </div>
+            
+            <!-- Bottom: Human Player -->
+            <div class="player-zone human-zone panel">
+                <div id="private-cards" class="cards-container">
+                    <!-- Cards will be injected here -->
+                </div>
+                <div class="player-info">
+                    <span class="player-name">You</span>
+                    <span class="chip-stack">Stack: <span id="human-stack">0</span></span>
+                    <span class="current-bet">Bet: <span id="human-bet">0</span></span>
+                </div>
+                
+                <div class="action-panel" id="action-panel">
+                    <p class="status-text" id="status-text">Waiting for AI...</p>
+                    <div class="action-buttons hidden" id="action-buttons">
+                        <button class="btn action-btn btn-fold" data-action="0" id="btn-fold">Fold</button>
+                        <button class="btn action-btn btn-call" data-action="1" id="btn-call">Call (0)</button>
+                        <button class="btn action-btn btn-raise" data-action="2" id="btn-raise">Raise</button>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

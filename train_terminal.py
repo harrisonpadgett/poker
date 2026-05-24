@@ -25,8 +25,7 @@ def main():
         start_time = time.time()
         start_iter = trainer.iterations + 1
         for i in range(start_iter, 10001):
-            # Reduced k_traversals from 100 to 20 for much faster iterations
-            trainer.train(n_iterations=1, k_traversals=20)
+            trainer.train(n_iterations=1, k_traversals=100)
             
             if i % 100 == 0:
                 trainer.save_checkpoint('checkpoint.pt')
