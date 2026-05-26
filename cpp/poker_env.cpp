@@ -1,24 +1,13 @@
 /*
- * poker_env.cpp — Royal Hold'em game logic implementation.
- *
- * BEGINNER NOTE: This file "implements" everything that was *declared* in
- * poker_env.h. Every function here corresponds to a declaration in the header.
- *
- * Key C++ concept used here: "pass by value" vs "pass by reference".
- *   - `int x`    → a copy of x. Changes don't affect the caller.
- *   - `int& x`   → a reference to the original. Changes DO affect the caller.
- *   - `const T&` → a read-only reference. Fast (no copy) but safe.
+ * poker_env.cpp — Royal Hold'em game logic.
  */
 
 #include "poker_env.h"
 #include <sstream>
 #include <numeric>
 #include <stdexcept>
-#include <cstring>   // for memcpy
+#include <cstring>
 
-// ---------------------------------------------------------------------------
-// Card helpers
-// ---------------------------------------------------------------------------
 static const char* RANKS = "TJQKA";
 static const char* SUITS = "cdhs";
 
@@ -29,14 +18,6 @@ std::string card_str(int card) {
     return s;
 }
 
-// ---------------------------------------------------------------------------
-// Hand evaluation
-//
-// BEGINNER NOTE: C++ arrays are fixed-size and live on the stack —
-// allocating `int rank_counts[5] = {}` is a single CPU instruction.
-// Python would create a list object, allocate heap memory, add reference
-// counting overhead, etc. This is why tight loops in C++ are so much faster.
-// ---------------------------------------------------------------------------
 HandScore evaluate_hand(const std::vector<int>& cards) {
     int rank_counts[5] = {};
     int suit_counts[4] = {};
@@ -51,9 +32,6 @@ HandScore evaluate_hand(const std::vector<int>& cards) {
         suits.push_back(s);
     }
 
-    // Helper lambda to pack a score tuple into a single int64.
-    // Each field gets 4 bits (values 0-15 are sufficient for our ranks).
-    // Category goes in the highest bits so comparison is correct.
     auto pack = [](int cat, int a=-1, int b=-1, int c=-1, int d=-1, int e=-1) -> long long {
         long long v = (long long)cat << 24;
         if (a >= 0) v |= (long long)(a+1) << 20;
@@ -65,9 +43,8 @@ HandScore evaluate_hand(const std::vector<int>& cards) {
     };
 
     // 1. Royal Flush
-    for (int s = 0; s < 4; s++) {
+    for (int s = 0; s < 4; s++)
         if (suit_counts[s] >= 5) return {pack(8)};
-    }
 
     // 2. Four of a Kind
     for (int r = 4; r >= 0; r--) {
@@ -87,12 +64,11 @@ HandScore evaluate_hand(const std::vector<int>& cards) {
     if (trips_list.size() >= 2) {
         return {pack(6, trips_list[0], trips_list[1])};
     } else if (!trips_list.empty()) {
-        for (int p : pair_list) {
+        for (int p : pair_list)
             if (p != trips_list[0]) return {pack(6, trips_list[0], p)};
-        }
     }
 
-    // 4. Straight (all 5 ranks present — only one possible straight in Royal: T-J-Q-K-A)
+    // 4. Straight
     bool has_all = true;
     for (int r = 0; r < 5; r++) if (rank_counts[r] == 0) { has_all = false; break; }
     if (has_all) return {pack(5)};
@@ -140,12 +116,9 @@ HandScore evaluate_hand(const std::vector<int>& cards) {
 // RoyalState implementation
 // ---------------------------------------------------------------------------
 
-RoyalState::RoyalState() {
-    reset();
-}
+RoyalState::RoyalState() { reset(); }
 
 RoyalState& RoyalState::reset(int seed) {
-    // Seed the RNG
     if (seed < 0) {
         std::random_device rd;
         rng = std::mt19937(rd());
@@ -153,17 +126,14 @@ RoyalState& RoyalState::reset(int seed) {
         rng = std::mt19937(seed);
     }
 
-    // Shuffle a 20-card deck
     int deck[N_CARDS];
-    std::iota(deck, deck + N_CARDS, 0);   // fill 0..19
+    std::iota(deck, deck + N_CARDS, 0);
     std::shuffle(deck, deck + N_CARDS, rng);
 
-    // Deal hole cards and community cards
     private_cards[0][0] = deck[0]; private_cards[0][1] = deck[1];
     private_cards[1][0] = deck[2]; private_cards[1][1] = deck[3];
     for (int i = 0; i < 5; i++) community_cards[i] = deck[4 + i];
 
-    // Reset state
     round   = 0;
     pot     = ANTE * 2;
     stacks[0] = stacks[1] = STARTING_STACK - ANTE;
@@ -171,20 +141,14 @@ RoyalState& RoyalState::reset(int seed) {
     to_act  = 0;
     raises  = 0;
     done    = false;
-    winner  = -2;   // undecided
+    winner  = -2;
     n_history = 0;
     n_acted = 0;
     memset(history, 0, sizeof(history));
-
     return *this;
 }
 
-// BEGINNER NOTE: `const` after a method means "this method doesn't change the object".
-// The compiler enforces this — if you accidentally write `this->done = true` inside
-// a const method, it will refuse to compile.
-RoyalState RoyalState::copy() const {
-    return *this;   // copies the entire struct — fast because it's stack-allocated
-}
+RoyalState RoyalState::copy() const { return *this; }
 
 std::vector<int> RoyalState::visible_community() const {
     if (round == 0) return {};
@@ -198,8 +162,13 @@ std::vector<int> RoyalState::visible_community() const {
 std::vector<int> RoyalState::legal_actions() const {
     if (done) return {};
     std::vector<int> actions = {FOLD, CALL};
-    if (raises < MAX_RAISES && stacks[to_act] >= BET_SIZES[round]) {
-        actions.push_back(RAISE_A);
+    if (raises < MAX_RAISES) {
+        int call_amt = bets[1 - to_act] - bets[to_act];
+        for (int i = 0; i < 3; i++) {
+            int needed = call_amt + RAISE_AMOUNTS[round][i];
+            if (stacks[to_act] >= needed)
+                actions.push_back(RAISE_S + i);
+        }
     }
     return actions;
 }
@@ -207,7 +176,6 @@ std::vector<int> RoyalState::legal_actions() const {
 RoyalState& RoyalState::apply_action(int action) {
     int player   = to_act;
     int opponent = 1 - player;
-    int bet      = BET_SIZES[round];
 
     history[n_history++] = action;
     n_acted++;
@@ -226,14 +194,13 @@ RoyalState& RoyalState::apply_action(int action) {
         stacks[player] -= call_amt;
         bets[player]   += call_amt;
         pot            += call_amt;
-
-        if (_round_over()) {
-            _advance_round();
-            return *this;
-        }
-    } else if (action == RAISE_A) {
-        int call_amt = bets[opponent] - bets[player];
-        int total    = std::min(call_amt + bet, stacks[player]);
+        if (_round_over()) { _advance_round(); return *this; }
+    } else {
+        // RAISE_S, RAISE_M, or RAISE_L
+        int raise_idx = action - RAISE_S;
+        int bet       = RAISE_AMOUNTS[round][raise_idx];
+        int call_amt  = bets[opponent] - bets[player];
+        int total     = std::min(call_amt + bet, stacks[player]);
         stacks[player] -= total;
         bets[player]   += total;
         pot            += total;
@@ -266,16 +233,14 @@ void RoyalState::_advance_round() {
         }
         pot = 0;
     } else {
-        to_act = 1;   // P1 acts first post-flop
+        to_act = 1;
     }
 }
 
 int RoyalState::_showdown_winner() const {
-    // Build 7-card hand for each player
     std::vector<int> hand0 = {private_cards[0][0], private_cards[0][1]};
     std::vector<int> hand1 = {private_cards[1][0], private_cards[1][1]};
     for (int c : community_cards) { hand0.push_back(c); hand1.push_back(c); }
-
     HandScore s0 = evaluate_hand(hand0);
     HandScore s1 = evaluate_hand(hand1);
     if (s0 > s1) return 0;

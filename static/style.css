@@ -216,6 +216,12 @@ h1 {
 
 .action-buttons {
     display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.action-row {
+    display: flex;
     gap: 0.5rem;
     justify-content: center;
 }
@@ -223,6 +229,8 @@ h1 {
 .action-btn {
     flex: 1;
     color: white;
+    font-size: 0.8rem;
+    padding: 0.45rem 0.5rem;
 }
 
 .btn-fold { background-color: var(--panel-border); }
@@ -231,8 +239,14 @@ h1 {
 .btn-call { background-color: #0ea5e9; }
 .btn-call:hover:not(:disabled) { background-color: #0284c7; }
 
-.btn-raise { background-color: var(--primary); }
-.btn-raise:hover:not(:disabled) { background-color: var(--primary-hover); }
+/* Three raise sizes: light → mid → dark blue */
+.btn-raise   { background-color: var(--primary); }
+.btn-raise-s { background-color: #6366f1; }
+.btn-raise-s:hover:not(:disabled) { background-color: #4f46e5; }
+.btn-raise-m { background-color: var(--primary); }
+.btn-raise-m:hover:not(:disabled) { background-color: var(--primary-hover); }
+.btn-raise-l { background-color: #7c3aed; }
+.btn-raise-l:hover:not(:disabled) { background-color: #6d28d9; }
 
 .action-btn:disabled {
     opacity: 0.4;

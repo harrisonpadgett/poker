@@ -1,101 +1,79 @@
 /*
- * bindings.cpp — pybind11 glue layer.
+ * bindings.cpp — pybind11 bindings for Royal Hold'em Deep CFR engine.
  *
- * FIX: Loading libtorch inside a pybind11 extension dlopen'd by a process
- * that already has PyTorch causes a double-libtorch conflict (SIGKILL).
- * SOLUTION: receive weight matrices as plain float arrays from Python and
- * perform the forward pass in raw C++.
- *
- * BLAS: cblas_sgemv is resolved at runtime via dlsym(RTLD_DEFAULT) so we
- * piggyback on the copy PyTorch already loaded — no link-time dependency,
- * no double-init conflict.
- *
- * Network: 89 → 128 → 128 → 3  (matches DeepCFRNetwork in deep_cfr.py)
- *
- * Per-thread buffers: each traversal thread accumulates samples into a
- * thread-local vector; after all threads join a single serial merge loop
- * inserts them into the shared reservoir.  This eliminates the std::mutex
- * that previously serialised every push() call.
+ * Architecture:
+ *   - 5 actions: Fold/Call/Raise-S/Raise-M/Raise-L
+ *   - 122-dim state: 1 player + 20 hole + 20 community + 80 history(16×5) + 1 is_suited
+ *   - 8 advantage networks: g_net[player][round]
+ *   - 12 buffers: adv[0..7] = player*4+round,  strat[8..11] = 8+round
+ *   - update_model_cache(player, round, fc1_w, fc1_b, fc2_w, fc2_b, out_w, out_b)
+ *   - run_traversals(k, iter, adv_buf_list[8], strat_buf_list[4])
  */
 
+#include "poker_env.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <dlfcn.h>
 #include <cstring>
-#include <cmath>
-#include <stdexcept>
-#include <random>
-#include <algorithm>
 #include <thread>
+#include <random>
 #include <vector>
-#include "poker_env.h"
-
-#if defined(__APPLE__) || defined(__linux__)
-#  include <dlfcn.h>
-#  define HAVE_DLSYM 1
-#endif
-
-// ---------------------------------------------------------------------------
-// Lazy BLAS handle
-// ---------------------------------------------------------------------------
-enum { CBLAS_ROW_MAJOR = 101, CBLAS_NO_TRANS = 111 };
-
-using cblas_sgemv_t = void (*)(int, int, int, int,
-                                float, const float*, int,
-                                const float*, int,
-                                float, float*, int);
-
-static cblas_sgemv_t g_sgemv      = nullptr;
-static bool          g_sgemv_init = false;
-
-static void init_blas() {
-    if (!g_sgemv_init) {
-#if defined(HAVE_DLSYM)
-        g_sgemv = reinterpret_cast<cblas_sgemv_t>(
-                      dlsym(RTLD_DEFAULT, "cblas_sgemv"));
-#endif
-        g_sgemv_init = true;
-    }
-}
+#include <atomic>
 
 namespace py = pybind11;
 
 // ---------------------------------------------------------------------------
-// Lightweight MLP — matches DeepCFRNetwork: 89→128→128→3
+// BLAS acceleration
+// ---------------------------------------------------------------------------
+typedef void (*cblas_sgemv_t)(int, int, int, int, float, const float*, int,
+                              const float*, int, float, float*, int);
+static cblas_sgemv_t cblas_sgemv_ptr = nullptr;
+
+void init_blas() {
+    void* handle = dlopen("@rpath/libBLAS.dylib", RTLD_NOLOAD);
+    if (!handle) handle = dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", RTLD_NOLOAD);
+    if (!handle) return;
+    cblas_sgemv_ptr = (cblas_sgemv_t)dlsym(handle, "cblas_sgemv");
+}
+
+// ---------------------------------------------------------------------------
+// LinearLayer
 // ---------------------------------------------------------------------------
 struct LinearLayer {
-    std::vector<float> weight;   // [out_features × in_features], row-major
-    std::vector<float> bias;     // [out_features]
-    int in_features;
-    int out_features;
+    std::vector<float> weight, bias;
+    int in_features, out_features;
 
     void forward(const float* input, float* output, bool relu) const {
-        if (g_sgemv) {
-            memcpy(output, bias.data(), out_features * sizeof(float));
-            g_sgemv(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS,
-                    out_features, in_features,
-                    1.0f, weight.data(), in_features,
-                    input, 1,
-                    1.0f, output, 1);
+        if (cblas_sgemv_ptr) {
+            cblas_sgemv_ptr(101, 111, out_features, in_features,
+                           1.0f, weight.data(), in_features,
+                           input, 1,
+                           0.0f, output, 1);
         } else {
-            for (int o = 0; o < out_features; o++) {
-                float s = bias[o];
-                const float* row = weight.data() + o * in_features;
-                for (int i = 0; i < in_features; i++) s += row[i] * input[i];
-                output[o] = s;
+            for (int i = 0; i < out_features; i++) {
+                float sum = 0.0f;
+                for (int j = 0; j < in_features; j++)
+                    sum += weight[i * in_features + j] * input[j];
+                output[i] = sum;
             }
         }
+        for (int i = 0; i < out_features; i++)
+            output[i] += bias[i];
         if (relu)
             for (int i = 0; i < out_features; i++)
                 output[i] = output[i] > 0.0f ? output[i] : 0.0f;
     }
 };
 
+// ---------------------------------------------------------------------------
+// CppMLP — 122 → 256 → 256 → 5  (per-player, per-round)
+// ---------------------------------------------------------------------------
 struct CppMLP {
-    LinearLayer fc1, fc2, out_layer;   // 89→256, 256→256, 256→3
+    LinearLayer fc1, fc2, out_layer;
     bool warm = false;
 
-    void forward(const float input[89], float output[3]) const {
+    void forward(const float input[122], float output[5]) const {
         float h1[256], h2[256];
         fc1.forward(input, h1, true);
         fc2.forward(h1,    h2, true);
@@ -103,7 +81,8 @@ struct CppMLP {
     }
 };
 
-static CppMLP g_net0, g_net1;
+// 8 independent specialists: g_net[player][round]
+static CppMLP g_net[2][4];
 
 static void load_layer(LinearLayer& layer, py::array_t<float> w_arr,
                        py::array_t<float> b_arr, int in_f, int out_f) {
@@ -116,24 +95,22 @@ static void load_layer(LinearLayer& layer, py::array_t<float> w_arr,
                         static_cast<float*>(bbuf.ptr) + out_f);
 }
 
-// Called from Python after train_adv_network() to sync weights to C++.
-// Network is now 89→256→256→3, so 3 layers (6 tensor arguments).
+// Sync PyTorch weights for one player/round combo into the C++ cache.
 void update_model_cache(
-    int player,
+    int player, int round,
     py::array_t<float> fc1_w, py::array_t<float> fc1_b,
     py::array_t<float> fc2_w, py::array_t<float> fc2_b,
     py::array_t<float> out_w, py::array_t<float> out_b
 ) {
-    CppMLP& net = (player == 0) ? g_net0 : g_net1;
-    load_layer(net.fc1,       fc1_w, fc1_b,  89, 256);
+    CppMLP& net = g_net[player][round];
+    load_layer(net.fc1,       fc1_w, fc1_b, 122, 256);
     load_layer(net.fc2,       fc2_w, fc2_b, 256, 256);
-    load_layer(net.out_layer, out_w, out_b,  256,   3);
+    load_layer(net.out_layer, out_w, out_b,  256,   5);
     net.warm = true;
 }
 
 // ---------------------------------------------------------------------------
-// Reservoir buffer — now mutex-free.  Only called from the serial merge
-// loop after all traversal threads have joined, so no concurrency needed.
+// Reservoir buffer
 // ---------------------------------------------------------------------------
 struct CppReservoirBuffer {
     float* states_ptr;
@@ -150,14 +127,6 @@ struct CppReservoirBuffer {
         if (n_inserted < capacity) {
             idx = n_inserted;
         } else {
-            // Cap the effective insertion count at 2×capacity.
-            // Pure reservoir sampling (denominator = n_inserted) freezes the
-            // buffer once n_inserted >> capacity: at n=377M, capacity=100k,
-            // each new sample has only a 0.027% insertion probability, making
-            // the buffer permanently stuck with ancient data.
-            // Capping at 2×capacity keeps insertion probability ≥ 50% forever,
-            // so the buffer fully refreshes every ~2*capacity/samples_per_iter
-            // iterations (~4k iters for the strategy buffer).
             int effective_n = std::min(n_inserted, 2 * capacity);
             std::uniform_int_distribution<int> dist(0, effective_n);
             idx = dist(rng);
@@ -173,27 +142,43 @@ struct CppReservoirBuffer {
 };
 
 // ---------------------------------------------------------------------------
-// Per-thread sample accumulation
+// Per-thread sample
 // ---------------------------------------------------------------------------
 struct LocalSample {
-    float state[89];
-    float target[3];
+    float state[122];   // 122-dim encoding
+    float target[5];    // 5-action target
     float weight;
-    int   buf_id;   // 0 = adv_buf_0, 1 = adv_buf_1, 2 = strat_buf
+    int   buf_id;       // 0-7: advantage (player*4+round),  8-11: strategy (8+round)
 };
 
-void encode_state(const RoyalState& state, int player, float out[89]) {
-    memset(out, 0, 89 * sizeof(float));
+// ---------------------------------------------------------------------------
+// encode_state — 122-dim layout:
+//   [0]       player index
+//   [1-20]    hole cards one-hot (20-card deck)
+//   [21-40]   visible community cards one-hot
+//   [41-120]  action history: 16 slots × N_ACTIONS=5 one-hot bits
+//   [121]     is_suited: 1 if both hole cards share the same suit
+// ---------------------------------------------------------------------------
+void encode_state(const RoyalState& state, int player, float out[122]) {
+    memset(out, 0, 122 * sizeof(float));
     out[0] = static_cast<float>(player);
-    for (int i = 0; i < 2; i++) out[1 + state.private_cards[player][i]] = 1.0f;
+
+    for (int i = 0; i < 2; i++)
+        out[1 + state.private_cards[player][i]] = 1.0f;
+
     auto vc = state.visible_community();
     for (int c : vc) out[21 + c] = 1.0f;
+
     for (int i = 0; i < state.n_history && i < 16; i++)
-        out[41 + i * 3 + state.history[i]] = 1.0f;
+        out[41 + i * N_ACTIONS + state.history[i]] = 1.0f;
+
+    out[121] = (state.private_cards[player][0] / 5 ==
+                state.private_cards[player][1] / 5) ? 1.0f : 0.0f;
 }
 
-// traverse() now collects into a thread-local vector instead of pushing
-// directly to a mutex-protected shared buffer.
+// ---------------------------------------------------------------------------
+// traverse — external sampling CFR
+// ---------------------------------------------------------------------------
 float traverse(RoyalState state, int traverser, int t,
                std::vector<LocalSample>& samples, std::mt19937& rng) {
     if (state.done) return state.payoff(traverser);
@@ -202,14 +187,14 @@ float traverse(RoyalState state, int traverser, int t,
     auto legal_actions = state.legal_actions();
     int n_legal = static_cast<int>(legal_actions.size());
 
-    float encoded[89];
+    float encoded[122];
     encode_state(state, player, encoded);
 
-    float advantages[3] = {};
-    const CppMLP& net = (player == 0) ? g_net0 : g_net1;
+    float advantages[5] = {};
+    const CppMLP& net = g_net[player][state.round];
     net.forward(encoded, advantages);
 
-    float strategy[3] = {};
+    float strategy[5] = {};
     float sum_pos = 0.0f;
     for (int a : legal_actions) sum_pos += std::max(0.0f, advantages[a]);
     if (sum_pos > 0.0f)
@@ -218,7 +203,7 @@ float traverse(RoyalState state, int traverser, int t,
         for (int a : legal_actions) strategy[a] = 1.0f / n_legal;
 
     if (player == traverser) {
-        float action_values[3] = {};
+        float action_values[5] = {};
         for (int a : legal_actions) {
             RoyalState next = state;
             next.apply_action(a);
@@ -226,22 +211,22 @@ float traverse(RoyalState state, int traverser, int t,
         }
         float ev = 0.0f;
         for (int a : legal_actions) ev += strategy[a] * action_values[a];
-        float sampled_adv[3] = {};
+        float sampled_adv[5] = {};
         for (int a : legal_actions) sampled_adv[a] = action_values[a] - ev;
 
         LocalSample s;
-        memcpy(s.state,  encoded,     89 * sizeof(float));
-        memcpy(s.target, sampled_adv,  3 * sizeof(float));
-        s.weight = static_cast<float>(t);
-        s.buf_id = traverser;   // 0 or 1
+        memcpy(s.state,  encoded,     122 * sizeof(float));
+        memcpy(s.target, sampled_adv,   5 * sizeof(float));
+        s.weight = static_cast<float>(std::max(t, 100));
+        s.buf_id = traverser * 4 + state.round;   // advantage buffer 0-7
         samples.push_back(s);
         return ev;
     } else {
         LocalSample s;
-        memcpy(s.state,  encoded,  89 * sizeof(float));
-        memcpy(s.target, strategy,  3 * sizeof(float));
-        s.weight = static_cast<float>(t);
-        s.buf_id = 2;   // strat buffer
+        memcpy(s.state,  encoded,  122 * sizeof(float));
+        memcpy(s.target, strategy,   5 * sizeof(float));
+        s.weight = static_cast<float>(std::max(t, 100));
+        s.buf_id = 8 + state.round;   // strategy buffer 8-11 (per round)
         samples.push_back(s);
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -257,41 +242,58 @@ float traverse(RoyalState state, int traverser, int t,
     }
 }
 
+// ---------------------------------------------------------------------------
+// run_traversals
+//
+// adv_buf_list  — py::list of 8 tuples (states, targets, weights, cap, n_ins)
+//                 indexed by player*4+round
+// strat_buf_list — py::list of 4 tuples (states, targets, weights, cap, n_ins)
+//                 indexed by round (0-3)
+// ---------------------------------------------------------------------------
 py::dict run_traversals(
     int k_traversals, int iteration,
-    py::object adv_states_0, py::object adv_targets_0, py::object adv_weights_0,
-    int adv_capacity_0, int adv_n_inserted_0,
-    py::object adv_states_1, py::object adv_targets_1, py::object adv_weights_1,
-    int adv_capacity_1, int adv_n_inserted_1,
-    py::object strat_states, py::object strat_targets, py::object strat_weights,
-    int strat_capacity, int strat_n_inserted
+    py::list adv_buf_list,
+    py::list strat_buf_list
 ) {
-    if (!g_net0.warm || !g_net1.warm)
-        throw std::runtime_error(
-            "Model cache not warm. Call update_model_cache() for both players first.");
+    for (int p = 0; p < 2; p++)
+        for (int r = 0; r < 4; r++)
+            if (!g_net[p][r].warm)
+                throw std::runtime_error(
+                    "Model cache not warm — call update_model_cache() for all 8 combos.");
 
-    auto get_ptr = [](py::object obj) -> float* {
-        auto arr = obj.cast<py::array_t<float>>();
-        return static_cast<float*>(arr.request().ptr);
-    };
+    // Unpack 8 advantage buffers
+    std::vector<py::array_t<float>> adv_s(8), adv_t(8), adv_w(8);
+    std::vector<CppReservoirBuffer> adv_bufs(8);
+    for (int i = 0; i < 8; i++) {
+        auto tup   = adv_buf_list[i].cast<py::tuple>();
+        adv_s[i]   = tup[0].cast<py::array_t<float>>();
+        adv_t[i]   = tup[1].cast<py::array_t<float>>();
+        adv_w[i]   = tup[2].cast<py::array_t<float>>();
+        adv_bufs[i] = {
+            static_cast<float*>(adv_s[i].request().ptr),
+            static_cast<float*>(adv_t[i].request().ptr),
+            static_cast<float*>(adv_w[i].request().ptr),
+            tup[3].cast<int>(), 122, 5, tup[4].cast<int>()
+        };
+    }
 
-    CppReservoirBuffer adv_buf_0 {
-        get_ptr(adv_states_0), get_ptr(adv_targets_0), get_ptr(adv_weights_0),
-        adv_capacity_0, 89, 3, adv_n_inserted_0
-    };
-    CppReservoirBuffer adv_buf_1 {
-        get_ptr(adv_states_1), get_ptr(adv_targets_1), get_ptr(adv_weights_1),
-        adv_capacity_1, 89, 3, adv_n_inserted_1
-    };
-    CppReservoirBuffer strat_buf {
-        get_ptr(strat_states), get_ptr(strat_targets), get_ptr(strat_weights),
-        strat_capacity, 89, 3, strat_n_inserted
-    };
+    // Unpack 4 strategy buffers
+    std::vector<py::array_t<float>> str_s(4), str_t(4), str_w(4);
+    std::vector<CppReservoirBuffer> strat_bufs(4);
+    for (int i = 0; i < 4; i++) {
+        auto tup   = strat_buf_list[i].cast<py::tuple>();
+        str_s[i]   = tup[0].cast<py::array_t<float>>();
+        str_t[i]   = tup[1].cast<py::array_t<float>>();
+        str_w[i]   = tup[2].cast<py::array_t<float>>();
+        strat_bufs[i] = {
+            static_cast<float*>(str_s[i].request().ptr),
+            static_cast<float*>(str_t[i].request().ptr),
+            static_cast<float*>(str_w[i].request().ptr),
+            tup[3].cast<int>(), 122, 5, tup[4].cast<int>()
+        };
+    }
 
-    // ------------------------------------------------------------------
-    // Phase 1: each thread traverses its share and collects samples locally.
-    // No mutexes — threads never touch each other's data.
-    // ------------------------------------------------------------------
+    // Phase 1: parallel traversal, no locks
     int n_threads = std::max(1, (int)std::thread::hardware_concurrency());
     std::vector<std::vector<LocalSample>> per_thread(n_threads);
     std::vector<std::thread> threads;
@@ -307,9 +309,7 @@ py::dict run_traversals(
         threads.emplace_back([&, t_idx, thread_k]() {
             std::mt19937 rng(std::random_device{}() ^ (uint32_t)t_idx);
             auto& local = per_thread[t_idx];
-            // Reserve a reasonable upper bound to avoid reallocations.
-            // Each traversal-pair generates ~60 samples on average.
-            local.reserve(thread_k * 70);
+            local.reserve(thread_k * 100);
             for (int k = 0; k < thread_k; k++) {
                 RoyalState state; state.reset();
                 traverse(state, 0, iteration, local, rng);
@@ -319,26 +319,24 @@ py::dict run_traversals(
     }
     for (auto& th : threads) th.join();
 
-    // ------------------------------------------------------------------
-    // Phase 2: single-threaded merge into the shared reservoir buffers.
-    // Serial insertion means reservoir sampling is unbiased and there are
-    // no data races.  For k=100 this loop processes ~6k samples in <2ms.
-    // ------------------------------------------------------------------
+    // Phase 2: serial merge
     std::mt19937 merge_rng(std::random_device{}());
     for (auto& local : per_thread) {
         for (const auto& s : local) {
-            switch (s.buf_id) {
-                case 0: adv_buf_0.push(s.state, s.target, s.weight, merge_rng); break;
-                case 1: adv_buf_1.push(s.state, s.target, s.weight, merge_rng); break;
-                case 2: strat_buf.push(s.state, s.target, s.weight, merge_rng); break;
+            if (s.buf_id <= 7) {
+                adv_bufs[s.buf_id].push(s.state, s.target, s.weight, merge_rng);
+            } else {
+                strat_bufs[s.buf_id - 8].push(s.state, s.target, s.weight, merge_rng);
             }
         }
     }
 
+    // Return updated insertion counts
     py::dict result;
-    result["adv_n_0"] = adv_buf_0.n_inserted;
-    result["adv_n_1"] = adv_buf_1.n_inserted;
-    result["strat_n"] = strat_buf.n_inserted;
+    for (int i = 0; i < 8; i++)
+        result[py::str("adv_n_" + std::to_string(i))] = adv_bufs[i].n_inserted;
+    for (int i = 0; i < 4; i++)
+        result[py::str("strat_n_" + std::to_string(i))] = strat_bufs[i].n_inserted;
     return result;
 }
 
@@ -346,9 +344,8 @@ py::dict run_traversals(
 // Module
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(poker_cpp, m) {
-    m.doc() = "Royal Hold'em C++ engine + Deep CFR traversal (native MLP, no libtorch)";
+    m.doc() = "Royal Hold'em C++ engine — Deep CFR with 5 actions and per-round networks";
 
-    // Resolve cblas_sgemv from PyTorch's already-loaded Accelerate/BLAS.
     init_blas();
 
     py::class_<RoyalState>(m, "RoyalState")
@@ -370,6 +367,7 @@ PYBIND11_MODULE(poker_cpp, m) {
         .def_readwrite("winner",   &RoyalState::winner)
         .def_readwrite("raises",   &RoyalState::raises)
         .def_readwrite("n_history",&RoyalState::n_history)
+        .def_readwrite("n_acted",  &RoyalState::n_acted)
         .def_property_readonly("stacks", [](const RoyalState& s) {
             return std::vector<int>{s.stacks[0], s.stacks[1]};
         })
@@ -382,6 +380,9 @@ PYBIND11_MODULE(poker_cpp, m) {
                 std::vector<int>{s.private_cards[1][0], s.private_cards[1][1]}
             );
         })
+        .def_property_readonly("community_cards", [](const RoyalState& s) {
+            return std::vector<int>(s.community_cards, s.community_cards + 5);
+        })
         .def_property_readonly("history", [](const RoyalState& s) {
             return std::vector<int>(s.history, s.history + s.n_history);
         });
@@ -389,8 +390,8 @@ PYBIND11_MODULE(poker_cpp, m) {
     m.def("card_str", &card_str);
 
     m.def("update_model_cache", &update_model_cache,
-        "Sync PyTorch model weights (89→128→128→3) to C++ cache",
-        py::arg("player"),
+        "Sync PyTorch weights for one player/round combo (122→256→256→5) to C++ cache.",
+        py::arg("player"), py::arg("round"),
         py::arg("fc1_w"), py::arg("fc1_b"),
         py::arg("fc2_w"), py::arg("fc2_b"),
         py::arg("out_w"), py::arg("out_b")
@@ -398,16 +399,15 @@ PYBIND11_MODULE(poker_cpp, m) {
 
     m.def("run_traversals", &run_traversals,
         py::arg("k_traversals"), py::arg("iteration"),
-        py::arg("adv_states_0"),  py::arg("adv_targets_0"),  py::arg("adv_weights_0"),
-        py::arg("adv_capacity_0"), py::arg("adv_n_inserted_0"),
-        py::arg("adv_states_1"),  py::arg("adv_targets_1"),  py::arg("adv_weights_1"),
-        py::arg("adv_capacity_1"), py::arg("adv_n_inserted_1"),
-        py::arg("strat_states"),  py::arg("strat_targets"),  py::arg("strat_weights"),
-        py::arg("strat_capacity"), py::arg("strat_n_inserted")
+        py::arg("adv_buf_list"),
+        py::arg("strat_buf_list")
     );
 
-    m.attr("FOLD")    = FOLD;
-    m.attr("CALL")    = CALL;
-    m.attr("RAISE")   = RAISE_A;
-    m.attr("N_CARDS") = N_CARDS;
+    m.attr("FOLD")      = FOLD;
+    m.attr("CALL")      = CALL;
+    m.attr("RAISE_S")   = RAISE_S;
+    m.attr("RAISE_M")   = RAISE_M;
+    m.attr("RAISE_L")   = RAISE_L;
+    m.attr("N_CARDS")   = N_CARDS;
+    m.attr("N_ACTIONS") = N_ACTIONS;
 }
