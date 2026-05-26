@@ -92,11 +92,11 @@ struct LinearLayer {
 };
 
 struct CppMLP {
-    LinearLayer fc1, fc2, out_layer;   // 89→128, 128→128, 128→3
+    LinearLayer fc1, fc2, out_layer;   // 89→256, 256→256, 256→3
     bool warm = false;
 
     void forward(const float input[89], float output[3]) const {
-        float h1[128], h2[128];
+        float h1[256], h2[256];
         fc1.forward(input, h1, true);
         fc2.forward(h1,    h2, true);
         out_layer.forward(h2, output, false);
@@ -117,7 +117,7 @@ static void load_layer(LinearLayer& layer, py::array_t<float> w_arr,
 }
 
 // Called from Python after train_adv_network() to sync weights to C++.
-// Network is now 89→128→128→3, so 3 layers (6 tensor arguments).
+// Network is now 89→256→256→3, so 3 layers (6 tensor arguments).
 void update_model_cache(
     int player,
     py::array_t<float> fc1_w, py::array_t<float> fc1_b,
@@ -125,9 +125,9 @@ void update_model_cache(
     py::array_t<float> out_w, py::array_t<float> out_b
 ) {
     CppMLP& net = (player == 0) ? g_net0 : g_net1;
-    load_layer(net.fc1,       fc1_w, fc1_b,  89, 128);
-    load_layer(net.fc2,       fc2_w, fc2_b, 128, 128);
-    load_layer(net.out_layer, out_w, out_b,  128,   3);
+    load_layer(net.fc1,       fc1_w, fc1_b,  89, 256);
+    load_layer(net.fc2,       fc2_w, fc2_b, 256, 256);
+    load_layer(net.out_layer, out_w, out_b,  256,   3);
     net.warm = true;
 }
 
@@ -150,7 +150,16 @@ struct CppReservoirBuffer {
         if (n_inserted < capacity) {
             idx = n_inserted;
         } else {
-            std::uniform_int_distribution<int> dist(0, n_inserted);
+            // Cap the effective insertion count at 2×capacity.
+            // Pure reservoir sampling (denominator = n_inserted) freezes the
+            // buffer once n_inserted >> capacity: at n=377M, capacity=100k,
+            // each new sample has only a 0.027% insertion probability, making
+            // the buffer permanently stuck with ancient data.
+            // Capping at 2×capacity keeps insertion probability ≥ 50% forever,
+            // so the buffer fully refreshes every ~2*capacity/samples_per_iter
+            // iterations (~4k iters for the strategy buffer).
+            int effective_n = std::min(n_inserted, 2 * capacity);
+            std::uniform_int_distribution<int> dist(0, effective_n);
             idx = dist(rng);
             if (idx >= capacity) { n_inserted++; return; }
         }
