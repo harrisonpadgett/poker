@@ -309,8 +309,11 @@ class DeepCFRTrainer:
         self.strat_nets = [StratNetwork().to(self.device) for _ in range(N_ROUNDS)]
 
         # Advantage optimizers: adv_opts[player][round]
+        # AdamW adds proper L2 weight decay, which regularises between warm restarts
+        # and reduces overfitting on buffers with imbalanced hand distributions.
         self.adv_opts = [
-            [torch.optim.Adam(self.adv_nets[p][r].parameters(), lr=adv_lr)
+            [torch.optim.AdamW(self.adv_nets[p][r].parameters(),
+                               lr=adv_lr, weight_decay=1e-4)
              for r in range(N_ROUNDS)]
             for p in range(2)
         ]
@@ -404,15 +407,38 @@ class DeepCFRTrainer:
                 # Warm restart every 1,000 iterations to escape local minima.
                 if self.iterations % 1000 == 0:
                     self.adv_nets[player][rnd] = DeepCFRNetwork().to(self.device)
-                    self.adv_opts[player][rnd] = torch.optim.Adam(
-                        self.adv_nets[player][rnd].parameters(), lr=0.001
+                    self.adv_opts[player][rnd] = torch.optim.AdamW(
+                        self.adv_nets[player][rnd].parameters(),
+                        lr=0.001, weight_decay=1e-4
                     )
                     steps = 500
+                    # LR warmup: first 10 steps at low lr so AdamW's moment
+                    # estimates stabilise before the full rate kicks in.
+                    WARMUP_STEPS = 10
+                    WARMUP_LR    = 0.0001
                 else:
-                    steps = 75
+                    # Adaptive steps: scale with buffer richness.
+                    # Small buffer → fewer steps (avoid overfitting on repeated
+                    # samples). Large buffer → more steps (exploit the rich data).
+                    # Max is 60, not 100 — keeps training time ~equal to the old
+                    # 75-step baseline so RBP traversal savings actually show up.
+                    if n < 10_000:
+                        steps = 20
+                    elif n < 100_000:
+                        steps = 40
+                    else:
+                        steps = 60
+                    WARMUP_STEPS = 0
+                    WARMUP_LR    = 0.001  # unused
 
                 self.adv_nets[player][rnd].train()
-                for _ in range(steps):
+                opt = self.adv_opts[player][rnd]
+                for step_i in range(steps):
+                    # Apply warmup LR for the first WARMUP_STEPS steps.
+                    if step_i == 0 and WARMUP_STEPS > 0:
+                        for pg in opt.param_groups: pg['lr'] = WARMUP_LR
+                    elif step_i == WARMUP_STEPS and WARMUP_STEPS > 0:
+                        for pg in opt.param_groups: pg['lr'] = 0.001
                     states, targets, weights = buf.sample(B)
                     states  = states.to(self.device)
                     targets = targets.to(self.device) / ADV_SCALE
@@ -421,9 +447,12 @@ class DeepCFRTrainer:
                     preds = self.adv_nets[player][rnd](states)
                     loss  = (weights * ((preds - targets) ** 2).sum(dim=1)).mean()
 
-                    self.adv_opts[player][rnd].zero_grad(set_to_none=True)
+                    opt.zero_grad(set_to_none=True)
                     loss.backward()
-                    self.adv_opts[player][rnd].step()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.adv_nets[player][rnd].parameters(), max_norm=1.0
+                    )
+                    opt.step()
 
                 losses.append(loss.item() * (ADV_SCALE ** 2))
 
@@ -463,6 +492,9 @@ class DeepCFRTrainer:
 
                 self.strat_opts[rnd].zero_grad(set_to_none=True)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.strat_nets[rnd].parameters(), max_norm=1.0
+                )
                 self.strat_opts[rnd].step()
 
                 if step_i >= steps - 20:
@@ -480,22 +512,32 @@ class DeepCFRTrainer:
     # C++ interface helpers
     # -------------------------------------------------------------------------
     def _export_adv_nets(self):
-        """Push all 8 advantage network weights into the C++ model cache."""
+        """Push all 8 advantage network weights into the C++ model cache.
+
+        Batching eval()/train() mode switches outside the per-network loop
+        avoids redundant Python attribute scans on every network object.
+        torch.no_grad() eliminates autograd bookkeeping during the export.
+        """
         import poker_cpp
-        for player in range(2):
-            for rnd in range(N_ROUNDS):
-                net = self.adv_nets[player][rnd]
-                net.eval()
-                poker_cpp.update_model_cache(
-                    player, rnd,
-                    net.fc1.weight.detach().cpu().numpy(),
-                    net.fc1.bias.detach().cpu().numpy(),
-                    net.fc2.weight.detach().cpu().numpy(),
-                    net.fc2.bias.detach().cpu().numpy(),
-                    net.out.weight.detach().cpu().numpy(),
-                    net.out.bias.detach().cpu().numpy(),
-                )
-                net.train()
+        for p in range(2):
+            for r in range(N_ROUNDS):
+                self.adv_nets[p][r].eval()
+        with torch.no_grad():
+            for player in range(2):
+                for rnd in range(N_ROUNDS):
+                    net = self.adv_nets[player][rnd]
+                    poker_cpp.update_model_cache(
+                        player, rnd,
+                        net.fc1.weight.cpu().numpy(),
+                        net.fc1.bias.cpu().numpy(),
+                        net.fc2.weight.cpu().numpy(),
+                        net.fc2.bias.cpu().numpy(),
+                        net.out.weight.cpu().numpy(),
+                        net.out.bias.cpu().numpy(),
+                    )
+        for p in range(2):
+            for r in range(N_ROUNDS):
+                self.adv_nets[p][r].train()
 
     def _buf_numpy(self, buf, field):
         return getattr(buf, field).numpy()
