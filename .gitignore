@@ -6,6 +6,7 @@ __pycache__/
 *.pt
 *.pth
 checkpoint.pt
+*.tmp.pt
 
 # C++ Build artifacts
 build/
