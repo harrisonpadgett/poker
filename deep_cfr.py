@@ -19,6 +19,11 @@ STATE_DIM = 1 + N_CARDS + N_CARDS + 16 * N_ACTIONS + 1   # = 122
 # Regret matching is scale-invariant, so this doesn't affect learned strategies.
 ADV_SCALE = 100.0
 
+# Discounted CFR exponents (Brown & Sandholm 2019)
+# Advantage samples weighted t^DCFR_ALPHA, strategy samples by t^DCFR_GAMMA.
+DCFR_ALPHA = 1.5
+DCFR_GAMMA = 2.0
+
 
 # ==============================================================================
 # Networks
@@ -374,13 +379,13 @@ class DeepCFRTrainer:
             for a in legal_actions:
                 sampled_adv[a] = action_values[a] - ev
 
-            w = max(t, 100)   # floor so early iterations aren't near-zero weight
+            w = max(t, 1) ** DCFR_ALPHA  # DCFR advantage weight
             self.adv_buffers[traverser][rnd].push(
                 (encoded.cpu().squeeze(0).numpy(), sampled_adv, w)
             )
             return ev
         else:
-            w = max(t, 100)
+            w = max(t, 1) ** DCFR_GAMMA  # DCFR strategy weight
             self.strat_buffers[rnd].push(
                 (encoded.cpu().squeeze(0).numpy(), strategy, w)
             )

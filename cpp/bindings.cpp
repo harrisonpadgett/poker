@@ -195,6 +195,26 @@ void encode_state(const RoyalState& state, int player, float out[122]) {
 static constexpr float PRUNE_THRESHOLD  = -0.03f;  // normalized (= -3 chips display)
 static constexpr int   PRUNE_START_ITER =  2000;   // wait until networks are mature
 
+// ---------------------------------------------------------------------------
+// Discounted CFR (DCFR) — Brown & Sandholm 2019
+//
+// Instead of Linear CFR's flat weight = t, DCFR weights samples by:
+//   advantage samples : t^DCFR_ALPHA   (α = 1.5  → recent regrets dominate)
+//   strategy  samples : t^DCFR_GAMMA   (γ = 2.0  → recent strategies dominate even more)
+//
+// The higher exponent on strategy means the final mixed strategy is almost
+// entirely determined by late iterations, accelerating convergence to Nash.
+// ---------------------------------------------------------------------------
+static constexpr float DCFR_ALPHA = 1.5f;
+static constexpr float DCFR_GAMMA = 2.0f;
+
+// ---------------------------------------------------------------------------
+// Thread count — settable from Python for the effort toggle.
+// 0 means "use hardware_concurrency()" (full speed).
+// ---------------------------------------------------------------------------
+static int g_num_threads = 0;
+void set_num_threads(int n) { g_num_threads = n; }
+
 float traverse(RoyalState state, int traverser, int t,
                std::vector<LocalSample>& samples, std::mt19937& rng) {
     if (state.done) return state.payoff(traverser);
@@ -241,7 +261,8 @@ float traverse(RoyalState state, int traverser, int t,
         LocalSample s;
         memcpy(s.state,  encoded,     122 * sizeof(float));
         memcpy(s.target, sampled_adv,   5 * sizeof(float));
-        s.weight = static_cast<float>(std::max(t, 100));
+        // DCFR: advantage weight = t^α  (heavier on recent iterations)
+        s.weight = std::pow(static_cast<float>(std::max(t, 1)), DCFR_ALPHA);
         s.buf_id = traverser * 4 + state.round;
         samples.push_back(s);
         return ev;
@@ -249,7 +270,8 @@ float traverse(RoyalState state, int traverser, int t,
         LocalSample s;
         memcpy(s.state,  encoded,  122 * sizeof(float));
         memcpy(s.target, strategy,   5 * sizeof(float));
-        s.weight = static_cast<float>(std::max(t, 100));
+        // DCFR: strategy weight = t^γ  (even stronger recency bias)
+        s.weight = std::pow(static_cast<float>(std::max(t, 1)), DCFR_GAMMA);
         s.buf_id = 8 + state.round;
         samples.push_back(s);
 
@@ -319,7 +341,9 @@ py::dict run_traversals(
     }
 
     // Phase 1: parallel traversal, no locks
-    int n_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    int n_threads = (g_num_threads > 0)
+        ? std::min(g_num_threads, (int)std::thread::hardware_concurrency())
+        : std::max(1, (int)std::thread::hardware_concurrency());
     std::vector<std::vector<LocalSample>> per_thread(n_threads);
     std::vector<std::thread> threads;
     threads.reserve(n_threads);
@@ -426,6 +450,11 @@ PYBIND11_MODULE(poker_cpp, m) {
         py::arg("k_traversals"), py::arg("iteration"),
         py::arg("adv_buf_list"),
         py::arg("strat_buf_list")
+    );
+
+    m.def("set_num_threads", &set_num_threads,
+        "Cap the number of CPU threads used by run_traversals (0 = all cores).",
+        py::arg("n")
     );
 
     m.attr("FOLD")      = FOLD;

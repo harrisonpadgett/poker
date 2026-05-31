@@ -1,6 +1,40 @@
+"""
+train_terminal.py — Deep CFR training with live terminal display.
+
+EFFORT TOGGLE
+─────────────
+Change the EFFORT variable below to control how hard the laptop works.
+All three levels produce the same trained model — lower effort just
+takes proportionally longer but keeps the machine cooler and quieter.
+
+  'high'   — all CPU cores, 800 traversals/iter  (~3–4s/iter, full speed)
+  'medium' — 4 threads,     500 traversals/iter  (~3–4s/iter, balanced)
+  'low'    — 2 threads,     250 traversals/iter  (~3–5s/iter, cool & quiet)
+"""
+
+EFFORT = 'medium'
+
+# ─── effort → hardware settings ────────────────────────────────────────────
+_EFFORT_CONFIGS = {
+    #          threads  k_trav  sleep_s
+    'high':   (0,       800,    0.0),   # 0 threads = use all hardware cores
+    'medium': (4,       500,    0.0),
+    'low':    (2,       250,    0.5),   # 0.5s breathing room between iters
+}
+if EFFORT not in _EFFORT_CONFIGS:
+    raise ValueError(f"EFFORT must be 'high', 'medium', or 'low'. Got: {EFFORT!r}")
+_N_THREADS, _K_TRAVERSALS, _SLEEP = _EFFORT_CONFIGS[EFFORT]
+
+# ───────────────────────────────────────────────────────────────────────────
+
+import time
+import torch
+import poker_cpp
 from deep_cfr import DeepCFRTrainer, encode_state, ADV_SCALE, N_ACTIONS
 from poker_env import RoyalState
-import time
+
+# Apply thread cap before any traversals run.
+poker_cpp.set_num_threads(_N_THREADS)
 
 
 def make_dummy_state(private_cards, round=0):
@@ -16,17 +50,21 @@ def make_dummy_state(private_cards, round=0):
 def main():
     print("=================================================================")
     print("          DEEP CFR TRAINING (ROYAL HOLD'EM — 5 ACTIONS)          ")
-    print("=================================================================\n")
+    print("=================================================================")
+    print(f"  Effort: {EFFORT}  |  threads: {'all' if _N_THREADS == 0 else _N_THREADS}"
+          f"  |  k_traversals: {_K_TRAVERSALS}"
+          f"  |  sleep: {_SLEEP}s\n")
 
     trainer = DeepCFRTrainer(adv_buffer_size=2_000_000, strat_buffer_size=2_000_000)
     trainer.load_checkpoint('checkpoint.pt')
 
     # Pocket Aces: Ac=4, Ad=9  |  Pocket Tens: Tc=0, Td=5
+    # Pre-encode once — these states never change.
     s_AA = make_dummy_state([4, 9])
     s_TT = make_dummy_state([0, 5])
-    t_AA = encode_state(s_AA, 0)
-    t_TT = encode_state(s_TT, 0)
-    legal_AA = s_AA.legal_actions()   # [0,1,2,3,4] from a full stack
+    t_AA = encode_state(s_AA, 0).to(trainer.device)
+    t_TT = encode_state(s_TT, 0).to(trainer.device)
+    legal_AA = s_AA.legal_actions()
     legal_TT = s_TT.legal_actions()
 
     header = f"{'ITER':<6} | {'ADV LOSS':>10} | {'STRAT LOSS':>10}"
@@ -37,33 +75,38 @@ def main():
         start_time = time.time()
         start_iter = trainer.iterations + 1
         for i in range(start_iter, 100_001):
-            trainer.train(n_iterations=1, k_traversals=800)
+            trainer.train(n_iterations=1, k_traversals=_K_TRAVERSALS)
+
+            if _SLEEP > 0:
+                time.sleep(_SLEEP)
 
             status_msg = ""
             if i % 100 == 0:
                 trainer.save_checkpoint('checkpoint.pt', verbose=False)
                 status_msg = "[+] Checkpoint saved"
 
-            adv_loss  = f"{trainer.adv_loss:.4f}"  if trainer.adv_loss  else "0.0000"
+            adv_loss   = f"{trainer.adv_loss:.4f}"  if trainer.adv_loss  else "0.0000"
             strat_loss = f"{trainer.strat_loss:.4f}" if trainer.strat_loss else "0.0000"
 
-            import torch
             # Evaluate the preflop advantage network (round 0) — The Brain
             trainer.adv_nets[0][0].eval()
             with torch.no_grad():
-                adv_AA = (trainer.adv_nets[0][0](t_AA.to(trainer.device).unsqueeze(0))
+                adv_AA = (trainer.adv_nets[0][0](t_AA.unsqueeze(0))
                           .squeeze(0).cpu().numpy() * ADV_SCALE)
-                adv_TT = (trainer.adv_nets[0][0](t_TT.to(trainer.device).unsqueeze(0))
+                adv_TT = (trainer.adv_nets[0][0](t_TT.unsqueeze(0))
                           .squeeze(0).cpu().numpy() * ADV_SCALE)
 
-            probs_AA = trainer.get_average_strategy_from_tensor(t_AA, legal_AA, round=0)
-            probs_TT = trainer.get_average_strategy_from_tensor(t_TT, legal_TT, round=0)
+            # Use CPU tensor for strategy lookup (get_average_strategy_from_tensor handles device)
+            t_AA_cpu = t_AA.cpu()
+            t_TT_cpu = t_TT.cpu()
+            probs_AA = trainer.get_average_strategy_from_tensor(t_AA_cpu, legal_AA, round=0)
+            probs_TT = trainer.get_average_strategy_from_tensor(t_TT_cpu, legal_TT, round=0)
 
             # Move cursor up 10 lines after first iteration
             if i > start_iter:
                 print("\033[10A", end="")
 
-            elapsed = time.time() - start_time
+            elapsed   = time.time() - start_time
             remaining = elapsed * (100_000 - i)
 
             print(f"Elapsed: {elapsed:.2f}s  ETA: {remaining:.0f}s\033[K")
