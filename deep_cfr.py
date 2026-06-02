@@ -188,8 +188,8 @@ def _make_rollout_state(cpp_state, ai_player, opp_hand):
     Returns None if opp_hand conflicts with known cards.
     """
     ai_cards    = list(cpp_state.private[ai_player])
-    vis_comm    = list(cpp_state.visible_community())
-    full_comm   = list(cpp_state.community_cards)   # all 5, pre-dealt
+    vis_comm    = list(cpp_state.visible_community if not callable(getattr(cpp_state, "visible_community")) else cpp_state.visible_community())
+    full_comm   = list(cpp_state.community if not hasattr(cpp_state, "community_cards") else cpp_state.community_cards)   # all 5, pre-dealt
 
     # Sanity check: opponent hand doesn't collide with known cards
     known = set(ai_cards) | set(full_comm)

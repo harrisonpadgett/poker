@@ -1,3 +1,4 @@
+
 """
 train_terminal.py — Deep CFR training with live terminal display.
 
@@ -12,7 +13,7 @@ takes proportionally longer but keeps the machine cooler and quieter.
   'low'    — 2 threads,     250 traversals/iter  (~3–5s/iter, cool & quiet)
 """
 
-EFFORT = 'medium'
+EFFORT = 'high'
 
 # ─── effort → hardware settings ────────────────────────────────────────────
 _EFFORT_CONFIGS = {
@@ -28,6 +29,7 @@ _N_THREADS, _K_TRAVERSALS, _SLEEP = _EFFORT_CONFIGS[EFFORT]
 # ───────────────────────────────────────────────────────────────────────────
 
 import time
+import json
 import torch
 import poker_cpp
 from deep_cfr import DeepCFRTrainer, encode_state, ADV_SCALE, N_ACTIONS
@@ -83,6 +85,13 @@ def main():
             status_msg = ""
             if i % 100 == 0:
                 trainer.save_checkpoint('checkpoint.pt', verbose=False)
+                # Write lightweight stats for the web app to read
+                with open('stats.json', 'w') as _sf:
+                    json.dump({
+                        'iterations': trainer.iterations,
+                        'adv_loss':   float(trainer.adv_loss),
+                        'strat_loss': float(trainer.strat_loss),
+                    }, _sf)
                 status_msg = "[+] Checkpoint saved"
 
             adv_loss   = f"{trainer.adv_loss:.4f}"  if trainer.adv_loss  else "0.0000"

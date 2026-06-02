@@ -3,69 +3,223 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Deep CFR vs Human</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+    <title>Royal Hold'em — Deep CFR Poker AI</title>
+    <meta name="description" content="A Nash Equilibrium poker AI trained via Deep Counterfactual Regret Minimization (Deep CFR) — the algorithm family behind Libratus and Pluribus.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="container modern-ui">
-        <header>
-            <h1>Royal Hold'em AI</h1>
-            <button id="start-btn" class="btn primary glowing-hover">New Game</button>
+    <div class="app">
+
+        <!-- ── Header ─────────────────────────────────────────────────── -->
+        <header class="app-header">
+            <div class="header-left">
+                <h1>Royal Hold'em <span class="gradient-text">AI</span></h1>
+                <div class="tech-badges">
+                    <span class="badge badge-cfr">Deep CFR</span>
+                    <span class="badge badge-nash">Nash Equilibrium</span>
+                    <span class="badge badge-rl">Self-Play RL</span>
+                </div>
+            </div>
+            <button id="start-btn" class="btn-new-game">New Game</button>
         </header>
 
-        <div id="game-board" class="hidden">
+        <!-- ── Main layout ────────────────────────────────────────────── -->
+        <div class="main-layout">
 
-            <!-- Top: AI Opponent -->
-            <div class="player-zone ai-zone panel">
-                <div class="player-info">
-                    <span class="player-name">AI Opponent</span>
-                    <span class="chip-stack">Stack: <span id="ai-stack">0</span></span>
-                    <span class="current-bet">Bet: <span id="ai-bet">0</span></span>
-                </div>
-                <div id="ai-cards" class="cards-container"></div>
-            </div>
-
-            <!-- Middle: Table -->
-            <div class="table-zone panel highlight">
-                <div class="table-info">
-                    <div class="pot">Pot: <span id="pot-amount">0</span></div>
-                    <div class="round"><span id="round-state">Preflop</span></div>
-                </div>
-                <div class="winner hidden" id="winner-banner"><span id="winner-text"></span></div>
-                <div id="community-cards" class="cards-container"></div>
-                <div class="action-history" id="history-log"></div>
-            </div>
-
-            <!-- Bottom: Human Player -->
-            <div class="player-zone human-zone panel">
-                <div id="private-cards" class="cards-container"></div>
-                <div class="player-info">
-                    <span class="player-name">You</span>
-                    <span class="chip-stack">Stack: <span id="human-stack">0</span></span>
-                    <span class="current-bet">Bet: <span id="human-bet">0</span></span>
-                </div>
-
-                <div class="action-panel" id="action-panel">
-                    <p class="status-text" id="status-text">Waiting for AI...</p>
-                    <div class="action-buttons hidden" id="action-buttons">
-                        <!-- Row 1: Fold / Call -->
-                        <div class="action-row">
-                            <button class="btn action-btn btn-fold"  data-action="0" id="btn-fold">Fold</button>
-                            <button class="btn action-btn btn-call"  data-action="1" id="btn-call">Call (0)</button>
+            <!-- ── Left: Information ──────────────────────────────────── -->
+            <div class="info-column">
+                <!-- How It Works -->
+                <div class="panel about-panel">
+                    <div class="panel-title">
+                        How This AI Works
+                    </div>
+                    <p class="about-intro">
+                        Built with <strong>Deep Counterfactual Regret Minimization (Deep CFR)</strong> — the algorithm family behind <em>Libratus</em> and <em>Pluribus</em>, which defeated world-champion poker players.
+                    </p>
+                    <div class="concept-grid">
+                        <div class="concept-card">
+                            <div class="concept-body">
+                                <div class="concept-title">Nash Equilibrium</div>
+                                <div class="concept-desc">A strategy no opponent can exploit — provably optimal in a game-theoretic sense.</div>
+                            </div>
                         </div>
-                        <!-- Row 2: Three raise sizes -->
-                        <div class="action-row" id="raise-row">
-                            <button class="btn action-btn btn-raise btn-raise-s" data-action="2" id="btn-raise-s">Bet S</button>
-                            <button class="btn action-btn btn-raise btn-raise-m" data-action="3" id="btn-raise-m">Bet M</button>
-                            <button class="btn action-btn btn-raise btn-raise-l" data-action="4" id="btn-raise-l">Bet L</button>
+                        <div class="concept-card">
+                            <div class="concept-body">
+                                <div class="concept-title">Self-Play</div>
+                                <div class="concept-desc">Zero human data. The AI discovers strategy entirely by playing millions of games against itself.</div>
+                            </div>
+                        </div>
+                        <div class="concept-card">
+                            <div class="concept-body">
+                                <div class="concept-title">12 Neural Networks</div>
+                                <div class="concept-desc">8 advantage nets learn regret per betting round. 4 strategy nets accumulate the final equilibrium policy.</div>
+                            </div>
+                        </div>
+                        <div class="concept-card">
+                            <div class="concept-body">
+                                <div class="concept-title">C++ + PyTorch</div>
+                                <div class="concept-desc">Parallel C++ game tree traversal runs concurrently with PyTorch gradient updates every iteration.</div>
+                            </div>
                         </div>
                     </div>
                 </div>
-            </div>
+            </div><!-- /info-column -->
 
-        </div>
-    </div>
+            <!-- ── Middle: Game ─────────────────────────────────────────── -->
+            <div class="game-column">
+
+                <!-- Session Record (Moved to top of game column) -->
+                <div class="panel session-panel" style="margin-bottom: 0.75rem; padding: 0.75rem 1rem;">
+                    <div class="session-record">
+                        <div class="session-item wins-item">
+                            <div class="session-count" id="session-wins">0</div>
+                            <div class="session-item-label">Your Wins</div>
+                        </div>
+                        <div class="session-vs">vs</div>
+                        <div class="session-item losses-item">
+                            <div class="session-count" id="session-losses">0</div>
+                            <div class="session-item-label">AI Wins</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="game-board">
+
+                    <!-- Human Player -->
+                    <div class="player-zone human-zone panel">
+                        <div id="private-cards" class="cards-row"></div>
+                        <div class="player-header" style="margin-top:0.5rem">
+                            <div class="player-identity">
+                                <span class="player-avatar human-avatar">P1</span>
+                                <div>
+                                    <div class="player-name">You</div>
+                                    <div class="player-subtitle" id="status-text">Waiting…</div>
+                                </div>
+                            </div>
+                            <div class="player-chips">
+                                <div class="chip-item">
+                                    <span class="chip-label">Stack</span>
+                                    <span class="chip-value" id="human-stack">100</span>
+                                </div>
+                                <div class="chip-item">
+                                    <span class="chip-label">Bet</span>
+                                    <span class="chip-value bet-value" id="human-bet">0</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="action-area hidden" id="action-buttons">
+                            <div class="action-row">
+                                <button class="btn-action btn-fold"   data-action="0" id="btn-fold">Fold</button>
+                                <button class="btn-action btn-call"   data-action="1" id="btn-call">Call</button>
+                            </div>
+                            <div class="action-row" id="raise-row">
+                                <button class="btn-action btn-raise-s" data-action="2" id="btn-raise-s">Bet S</button>
+                                <button class="btn-action btn-raise-m" data-action="3" id="btn-raise-m">Bet M</button>
+                                <button class="btn-action btn-raise-l" data-action="4" id="btn-raise-l">Bet L</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Table -->
+                    <div class="table-zone panel">
+                        <div class="table-header">
+                            <div class="round-indicator">
+                                <span class="round-dot"></span>
+                                <span id="round-state">Preflop</span>
+                            </div>
+                            <div class="pot-display">
+                                <span class="pot-label">POT</span>
+                                <span class="pot-value" id="pot-amount">0</span>
+                            </div>
+                        </div>
+                        <div id="community-cards" class="cards-row community-cards">
+                            <div class="no-cards-hint">Community cards will appear here</div>
+                        </div>
+                        <div id="winner-banner" class="winner-banner hidden">
+                            <div id="winner-text" style="margin-bottom: 1rem; font-weight: 600;"></div>
+                            <button id="btn-play-again" class="btn-new-game" style="width: 100%;">Play Again</button>
+                        </div>
+                        <div id="history-log" class="history-log"></div>
+                    </div>
+
+                    <!-- AI Opponent -->
+                    <div class="player-zone ai-zone panel">
+                        <div class="player-header">
+                            <div class="player-identity">
+                                <span class="player-avatar ai-avatar">AI</span>
+                                <div>
+                                    <div class="player-name">Deep CFR AI</div>
+                                    <div class="player-subtitle">Nash Equilibrium Strategy</div>
+                                </div>
+                            </div>
+                            <div class="player-chips">
+                                <div class="chip-item">
+                                    <span class="chip-label">Stack</span>
+                                    <span class="chip-value" id="ai-stack">100</span>
+                                </div>
+                                <div class="chip-item">
+                                    <span class="chip-label">Bet</span>
+                                    <span class="chip-value bet-value" id="ai-bet">0</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="ai-cards" class="cards-row"></div>
+                    </div>
+
+                </div><!-- /game-board -->
+            </div><!-- /game-column -->
+
+            <!-- ── Right: Analysis ────────────────────────────────────── -->
+            <div class="analysis-column">
+
+                <!-- AI Intelligence Panel -->
+                <div class="panel intelligence-panel">
+                    <div class="panel-title">
+                        AI Intelligence Panel
+                    </div>
+
+                    <!-- Empty state -->
+                    <div id="intel-empty" class="intel-empty">
+                        <p>AI decision breakdown will appear here after the first move.</p>
+                        <p class="intel-empty-sub">You'll see the exact probability the AI assigned to each action and the raw neural network outputs.</p>
+                    </div>
+
+                    <!-- Active state -->
+                    <div id="intel-active" class="hidden">
+
+                        <!-- Last decision badge -->
+                        <div class="last-decision-row" style="flex-direction: column; align-items: flex-start; gap: 0.5rem; background: rgba(255,255,255,0.05); padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem;">
+                            <span class="last-decision-label" style="margin: 0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7;">AI's Last Decision</span>
+                            <span id="last-action-name" style="font-size: 0.95rem; line-height: 1.5;">—</span>
+                        </div>
+
+                        <!-- Nash Strategy Distribution -->
+                        <div class="intel-section">
+                            <div class="intel-section-header">
+                                <span class="intel-section-title">Nash Strategy Distribution</span>
+                                <span class="intel-section-desc">Mixed equilibrium — probability assigned to each action</span>
+                            </div>
+                            <div id="prob-bars" class="prob-bars"></div>
+                        </div>
+
+                        <!-- Neural Network (Brain) Output -->
+                        <div class="intel-section">
+                            <div class="intel-section-header">
+                                <span class="intel-section-title">Neural Network Output <span class="brain-tag">Brain</span></span>
+                                <span class="intel-section-desc">Advantage per action in chips — positive means "do this more"</span>
+                            </div>
+                            <div id="adv-bars" class="adv-bars"></div>
+                        </div>
+
+                    </div><!-- /intel-active -->
+                </div>
+
+            </div><!-- /analysis-column -->
+        </div><!-- /main-layout -->
+    </div><!-- /app -->
 
     <script src="/static/script.js"></script>
 </body>

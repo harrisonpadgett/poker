@@ -255,8 +255,17 @@ float traverse(RoyalState state, int traverser, int t,
         // EV is unbiased: pruned actions have strategy[a]==0 so contribute 0.
         float ev = 0.0f;
         for (int a : legal_actions) ev += strategy[a] * action_values[a];
+        
         float sampled_adv[5] = {};
-        for (int a : legal_actions) sampled_adv[a] = action_values[a] - ev;
+        for (int a : legal_actions) {
+            if (do_prune && strategy[a] == 0.0f && advantages[a] < PRUNE_THRESHOLD) {
+                // For pruned actions, use the raw advantage estimate as the target
+                sampled_adv[a] = advantages[a];
+            } else {
+                // For explored actions, calculate the true regret
+                sampled_adv[a] = action_values[a] - ev;
+            }
+        }
 
         LocalSample s;
         memcpy(s.state,  encoded,     122 * sizeof(float));
