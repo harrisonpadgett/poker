@@ -13,17 +13,18 @@ takes proportionally longer but keeps the machine cooler and quieter.
   'low'    — 2 threads,     250 traversals/iter  (~3–5s/iter, cool & quiet)
 """
 
-EFFORT = 'high'
+EFFORT = 'medium-high'
 
 # ─── effort → hardware settings ────────────────────────────────────────────
 _EFFORT_CONFIGS = {
-    #          threads  k_trav  sleep_s
-    'high':   (0,       800,    0.0),   # 0 threads = use all hardware cores
-    'medium': (4,       500,    0.0),
-    'low':    (2,       250,    0.5),   # 0.5s breathing room between iters
+    #                   threads  k_trav  sleep_s
+    'high':        (0,       800,    0.0),   # 0 threads = use all hardware cores
+    'medium-high': (6,       650,    0.1),   # 6 threads, brief pause to avoid overheating
+    'medium':      (4,       500,    0.0),
+    'low':         (2,       250,    0.5),   # 0.5s breathing room between iters
 }
 if EFFORT not in _EFFORT_CONFIGS:
-    raise ValueError(f"EFFORT must be 'high', 'medium', or 'low'. Got: {EFFORT!r}")
+    raise ValueError(f"EFFORT must be 'high', 'medium-high', 'medium', or 'low'. Got: {EFFORT!r}")
 _N_THREADS, _K_TRAVERSALS, _SLEEP = _EFFORT_CONFIGS[EFFORT]
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ def main():
                 time.sleep(_SLEEP)
 
             status_msg = ""
-            if i % 100 == 0:
+            if i % 50 == 0:
                 trainer.save_checkpoint('checkpoint.pt', verbose=False)
                 # Write lightweight stats for the web app to read
                 with open('stats.json', 'w') as _sf:
@@ -140,7 +141,10 @@ def main():
             start_time = time.time()
 
     except KeyboardInterrupt:
-        print("\nTraining interrupted. Saving checkpoint...")
+        print("\nTraining interrupted.")
+        print("Running final strategy training pass (2000 steps)...")
+        trainer.train_strat_network_final(n_steps=2000)
+        print("Saving checkpoint...")
         trainer.save_checkpoint('checkpoint.pt')
         print("Done.")
 

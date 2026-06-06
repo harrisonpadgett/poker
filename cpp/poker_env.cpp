@@ -135,9 +135,11 @@ RoyalState& RoyalState::reset(int seed) {
     for (int i = 0; i < 5; i++) community_cards[i] = deck[4 + i];
 
     round   = 0;
-    pot     = ANTE * 2;
-    stacks[0] = stacks[1] = STARTING_STACK - ANTE;
-    bets[0]   = bets[1]   = ANTE;
+    pot     = SB + BB;
+    stacks[0] = STARTING_STACK - SB;
+    stacks[1] = STARTING_STACK - BB;
+    bets[0]   = SB;
+    bets[1]   = BB;
     to_act  = 0;
     raises  = 0;
     done    = false;
@@ -164,8 +166,10 @@ std::vector<int> RoyalState::legal_actions() const {
     std::vector<int> actions = {FOLD, CALL};
     if (raises < MAX_RAISES) {
         int call_amt = bets[1 - to_act] - bets[to_act];
+        int raise_sizes[3];
+        compute_raise_sizes(pot, call_amt, raise_sizes);
         for (int i = 0; i < 3; i++) {
-            int needed = call_amt + RAISE_AMOUNTS[round][i];
+            int needed = call_amt + raise_sizes[i];
             if (stacks[to_act] >= needed)
                 actions.push_back(RAISE_S + i);
         }
@@ -196,11 +200,13 @@ RoyalState& RoyalState::apply_action(int action) {
         pot            += call_amt;
         if (_round_over()) { _advance_round(); return *this; }
     } else {
-        // RAISE_S, RAISE_M, or RAISE_L
+        // RAISE_S, RAISE_M, or RAISE_L — pot-relative sizing
         int raise_idx = action - RAISE_S;
-        int bet       = RAISE_AMOUNTS[round][raise_idx];
         int call_amt  = bets[opponent] - bets[player];
-        int total     = std::min(call_amt + bet, stacks[player]);
+        int raise_sizes[3];
+        compute_raise_sizes(pot, call_amt, raise_sizes);
+        int bet   = raise_sizes[raise_idx];
+        int total = std::min(call_amt + bet, stacks[player]);
         stacks[player] -= total;
         bets[player]   += total;
         pot            += total;

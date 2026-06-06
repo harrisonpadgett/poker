@@ -3,16 +3,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import random
-from poker_env import (N_CARDS, N_ACTIONS, RAISE_AMOUNTS, card_str,
-                       RoyalState, FOLD, CALL, RAISE_S, RAISE_M, RAISE_L)
+from poker_env import (N_CARDS, N_ACTIONS, get_raise_sizes, card_str,
+                       RoyalState, FOLD, CALL, RAISE_S, RAISE_M, RAISE_L,
+                       SB, BB)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 N_ROUNDS  = 4   # Preflop, Flop, Turn, River
 
-# State encoding: 1 (player) + 20 (hole) + 20 (community) + 16*N_ACTIONS (history) + 1 (is_suited)
-STATE_DIM = 1 + N_CARDS + N_CARDS + 16 * N_ACTIONS + 1   # = 122
+# State encoding:
+#   1 (player) + 20 (hole) + 20 (community) + 16*N_ACTIONS (history)
+#   + 1 (is_suited) + 4 (pot, stacks×2, call_amount)
+STATE_DIM = 1 + N_CARDS + N_CARDS + 16 * N_ACTIONS + 1 + 4   # = 126
 
 # Advantage targets are in chip units (max payoff ≈ ±99 for Royal Hold'em).
 # Normalising to ~[-1,1] keeps Adam's per-param LR scale healthy.
@@ -30,7 +33,7 @@ DCFR_GAMMA = 2.0
 # ==============================================================================
 
 class DeepCFRNetwork(nn.Module):
-    """Advantage network — 122 → 256 → 256 → 5.
+    """Advantage network — STATE_DIM(126) → 256 → 256 → 5.
 
     One instance per (player, round) combination (8 total).
     Must match C++ CppMLP exactly.
@@ -48,7 +51,7 @@ class DeepCFRNetwork(nn.Module):
 
 
 class StratNetwork(nn.Module):
-    """Average strategy network — 122 → 512 → 512 → 5.
+    """Average strategy network — STATE_DIM(126) → 512 → 512 → 5.
 
     One instance per round (4 total). Larger than each advantage network
     because it must memorise the full game tree for that round across
@@ -67,7 +70,7 @@ class StratNetwork(nn.Module):
 
 
 def encode_state(state, player):
-    """Encode RoyalState into a 122-dim float32 tensor for the given player.
+    """Encode RoyalState into a 126-dim float32 tensor for the given player.
 
     Layout  (must match C++ encode_state in bindings.cpp):
       [0]       player index (0 or 1)
@@ -75,6 +78,10 @@ def encode_state(state, player):
       [21-40]   visible community cards one-hot
       [41-120]  action history: 16 slots × N_ACTIONS=5 one-hot bits
       [121]     is_suited: 1.0 if both hole cards share the same suit
+      [122]     pot / 200.0      (normalized by max possible pot)
+      [123]     player stack / 100.0
+      [124]     opponent stack / 100.0
+      [125]     call_amount / 100.0
 
     Accepts both Python RoyalState (visible_community is a property)
     and C++ poker_cpp.RoyalState (visible_community() is a method).
@@ -99,6 +106,13 @@ def encode_state(state, player):
     cards = state.private[player]
     if cards[0] // 5 == cards[1] // 5:
         tensor[121] = 1.0
+
+    # Numeric context — required for pot-relative raise size interpretation
+    tensor[122] = state.pot / 200.0
+    tensor[123] = state.stacks[player] / 100.0
+    tensor[124] = state.stacks[1 - player] / 100.0
+    call_amt = max(0, state.bets[1 - player] - state.bets[player])
+    tensor[125] = call_amt / 100.0
 
     return tensor
 

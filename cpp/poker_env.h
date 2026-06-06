@@ -4,9 +4,14 @@
  * Action space (N_ACTIONS = 5):
  *   FOLD=0, CALL=1, RAISE_S=2 (small), RAISE_M=3 (medium), RAISE_L=4 (large)
  *
- * Raise amounts per round (chips):
- *   Preflop / Flop : 2 / 4 / 6
- *   Turn   / River : 4 / 6 / 8
+ * Raise amounts are pot-relative (computed dynamically):
+ *   RAISE_S : 33% of pot-after-call  (min BB)
+ *   RAISE_M : 66% of pot-after-call  (min BB)
+ *   RAISE_L : 100% of pot-after-call (min BB)
+ *
+ * Blind structure (heads-up):
+ *   Player 0 = Small Blind (SB) — posts 1 chip, acts first preflop
+ *   Player 1 = Big Blind  (BB) — posts 2 chips, acts first postflop
  */
 
 #pragma once
@@ -26,20 +31,22 @@ static constexpr int N_CARDS    = 20;
 static constexpr int N_ACTIONS  = 5;
 static constexpr int FOLD       = 0;
 static constexpr int CALL       = 1;
-static constexpr int RAISE_S    = 2;   // small raise
-static constexpr int RAISE_M    = 3;   // medium raise
-static constexpr int RAISE_L    = 4;   // large raise
-static constexpr int ANTE       = 1;
+static constexpr int RAISE_S    = 2;   // small raise  (~33% pot)
+static constexpr int RAISE_M    = 3;   // medium raise (~66% pot)
+static constexpr int RAISE_L    = 4;   // large raise  (~100% pot)
+static constexpr int SB         = 1;   // small blind
+static constexpr int BB         = 2;   // big blind
 static constexpr int MAX_RAISES = 2;
 static constexpr int STARTING_STACK = 100;
 
-// Raise chip amounts per round: [preflop, flop, turn, river] × [small, medium, large]
-static constexpr int RAISE_AMOUNTS[4][3] = {
-    {2, 4, 6},   // Preflop
-    {2, 4, 6},   // Flop
-    {4, 6, 8},   // Turn
-    {4, 6, 8},   // River
-};
+// Compute pot-relative raise sizes given current pot and call amount.
+// out[0] = 33% pot, out[1] = 66% pot, out[2] = 100% pot, all >= BB.
+inline void compute_raise_sizes(int pot, int call_amt, int out[3]) {
+    int pac = pot + call_amt;   // pot after call
+    out[0] = std::max(BB, pac / 3);
+    out[1] = std::max(BB, 2 * pac / 3);
+    out[2] = std::max(BB, pac);
+}
 
 // ---------------------------------------------------------------------------
 // Hand evaluation result

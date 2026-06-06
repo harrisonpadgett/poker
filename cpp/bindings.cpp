@@ -3,7 +3,8 @@
  *
  * Architecture:
  *   - 5 actions: Fold/Call/Raise-S/Raise-M/Raise-L
- *   - 122-dim state: 1 player + 20 hole + 20 community + 80 history(16×5) + 1 is_suited
+ *   - 126-dim state: 1 player + 20 hole + 20 community + 80 history(16×5) + 1 is_suited
+ *                    + 4 numeric context (pot, stacks×2, call_amount)
  *   - 8 advantage networks: g_net[player][round]
  *   - 12 buffers: adv[0..7] = player*4+round,  strat[8..11] = 8+round
  *   - update_model_cache(player, round, fc1_w, fc1_b, fc2_w, fc2_b, out_w, out_b)
@@ -22,6 +23,8 @@
 #include <atomic>
 
 namespace py = pybind11;
+
+static constexpr int STATE_DIM = 126;  // 1+20+20+80+1+4 (see encode_state)
 
 // ---------------------------------------------------------------------------
 // BLAS acceleration
@@ -67,13 +70,13 @@ struct LinearLayer {
 };
 
 // ---------------------------------------------------------------------------
-// CppMLP — 122 → 256 → 256 → 5  (per-player, per-round)
+// CppMLP — STATE_DIM → 256 → 256 → 5  (per-player, per-round)
 // ---------------------------------------------------------------------------
 struct CppMLP {
     LinearLayer fc1, fc2, out_layer;
     bool warm = false;
 
-    void forward(const float input[122], float output[5]) const {
+    void forward(const float input[STATE_DIM], float output[5]) const {
         float h1[256], h2[256];
         fc1.forward(input, h1, true);
         fc2.forward(h1,    h2, true);
@@ -103,9 +106,9 @@ void update_model_cache(
     py::array_t<float> out_w, py::array_t<float> out_b
 ) {
     CppMLP& net = g_net[player][round];
-    load_layer(net.fc1,       fc1_w, fc1_b, 122, 256);
-    load_layer(net.fc2,       fc2_w, fc2_b, 256, 256);
-    load_layer(net.out_layer, out_w, out_b,  256,   5);
+    load_layer(net.fc1,       fc1_w, fc1_b, STATE_DIM, 256);
+    load_layer(net.fc2,       fc2_w, fc2_b, 256,       256);
+    load_layer(net.out_layer, out_w, out_b,  256,         5);
     net.warm = true;
 }
 
@@ -145,22 +148,26 @@ struct CppReservoirBuffer {
 // Per-thread sample
 // ---------------------------------------------------------------------------
 struct LocalSample {
-    float state[122];   // 122-dim encoding
-    float target[5];    // 5-action target
+    float state[STATE_DIM]; // 126-dim encoding
+    float target[5];        // 5-action target
     float weight;
-    int   buf_id;       // 0-7: advantage (player*4+round),  8-11: strategy (8+round)
+    int   buf_id;           // 0-7: advantage (player*4+round),  8-11: strategy (8+round)
 };
 
 // ---------------------------------------------------------------------------
-// encode_state — 122-dim layout:
+// encode_state — 126-dim layout:
 //   [0]       player index
 //   [1-20]    hole cards one-hot (20-card deck)
 //   [21-40]   visible community cards one-hot
 //   [41-120]  action history: 16 slots × N_ACTIONS=5 one-hot bits
 //   [121]     is_suited: 1 if both hole cards share the same suit
+//   [122]     pot / 200.0      (normalized by max possible pot)
+//   [123]     player stack / 100.0
+//   [124]     opponent stack / 100.0
+//   [125]     call_amount / 100.0
 // ---------------------------------------------------------------------------
-void encode_state(const RoyalState& state, int player, float out[122]) {
-    memset(out, 0, 122 * sizeof(float));
+void encode_state(const RoyalState& state, int player, float out[STATE_DIM]) {
+    memset(out, 0, STATE_DIM * sizeof(float));
     out[0] = static_cast<float>(player);
 
     for (int i = 0; i < 2; i++)
@@ -174,6 +181,13 @@ void encode_state(const RoyalState& state, int player, float out[122]) {
 
     out[121] = (state.private_cards[player][0] / 5 ==
                 state.private_cards[player][1] / 5) ? 1.0f : 0.0f;
+
+    // Numeric context — required for pot-relative raise size interpretation
+    out[122] = state.pot / 200.0f;
+    out[123] = state.stacks[player] / 100.0f;
+    out[124] = state.stacks[1 - player] / 100.0f;
+    int call_amt = std::max(0, state.bets[1 - player] - state.bets[player]);
+    out[125] = call_amt / 100.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +237,7 @@ float traverse(RoyalState state, int traverser, int t,
     auto legal_actions = state.legal_actions();
     int n_legal = static_cast<int>(legal_actions.size());
 
-    float encoded[122];
+    float encoded[STATE_DIM];
     encode_state(state, player, encoded);
 
     float advantages[5] = {};
@@ -268,7 +282,7 @@ float traverse(RoyalState state, int traverser, int t,
         }
 
         LocalSample s;
-        memcpy(s.state,  encoded,     122 * sizeof(float));
+        memcpy(s.state,  encoded,     STATE_DIM * sizeof(float));
         memcpy(s.target, sampled_adv,   5 * sizeof(float));
         // DCFR: advantage weight = t^α  (heavier on recent iterations)
         s.weight = std::pow(static_cast<float>(std::max(t, 1)), DCFR_ALPHA);
@@ -277,7 +291,7 @@ float traverse(RoyalState state, int traverser, int t,
         return ev;
     } else {
         LocalSample s;
-        memcpy(s.state,  encoded,  122 * sizeof(float));
+        memcpy(s.state,  encoded,  STATE_DIM * sizeof(float));
         memcpy(s.target, strategy,   5 * sizeof(float));
         // DCFR: strategy weight = t^γ  (even stronger recency bias)
         s.weight = std::pow(static_cast<float>(std::max(t, 1)), DCFR_GAMMA);
@@ -329,7 +343,7 @@ py::dict run_traversals(
             static_cast<float*>(adv_s[i].request().ptr),
             static_cast<float*>(adv_t[i].request().ptr),
             static_cast<float*>(adv_w[i].request().ptr),
-            tup[3].cast<int>(), 122, 5, tup[4].cast<int>()
+            tup[3].cast<int>(), STATE_DIM, 5, tup[4].cast<int>()
         };
     }
 
@@ -345,7 +359,7 @@ py::dict run_traversals(
             static_cast<float*>(str_s[i].request().ptr),
             static_cast<float*>(str_t[i].request().ptr),
             static_cast<float*>(str_w[i].request().ptr),
-            tup[3].cast<int>(), 122, 5, tup[4].cast<int>()
+            tup[3].cast<int>(), STATE_DIM, 5, tup[4].cast<int>()
         };
     }
 
@@ -448,7 +462,7 @@ PYBIND11_MODULE(poker_cpp, m) {
     m.def("card_str", &card_str);
 
     m.def("update_model_cache", &update_model_cache,
-        "Sync PyTorch weights for one player/round combo (122→256→256→5) to C++ cache.",
+        "Sync PyTorch weights for one player/round combo (STATE_DIM→256→256→5) to C++ cache.",
         py::arg("player"), py::arg("round"),
         py::arg("fc1_w"), py::arg("fc1_b"),
         py::arg("fc2_w"), py::arg("fc2_b"),

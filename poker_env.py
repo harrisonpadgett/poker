@@ -4,9 +4,14 @@ poker_env.py — Royal Hold'em environment.
 Action space (N_ACTIONS = 5):
   FOLD=0, CALL=1, RAISE_S=2 (small), RAISE_M=3 (medium), RAISE_L=4 (large)
 
-Raise chip amounts per round:
-  Preflop / Flop : 2 / 4 / 6
-  Turn   / River : 4 / 6 / 8
+Raise amounts are pot-relative (computed dynamically):
+  RAISE_S : 33% of pot-after-call  (min BB)
+  RAISE_M : 66% of pot-after-call  (min BB)
+  RAISE_L : 100% of pot-after-call (min BB)
+
+Blind structure (heads-up):
+  Player 0 = Small Blind (SB=1) — acts first preflop
+  Player 1 = Big Blind  (BB=2) — acts first postflop
 """
 
 import numpy as np
@@ -37,16 +42,31 @@ ACTION_NAMES = ['Fold', 'Call', 'Raise-S', 'Raise-M', 'Raise-L']
 # ---------------------------------------------------------------------------
 # Game constants
 # ---------------------------------------------------------------------------
-ANTE       = 1
+SB         = 1   # small blind (Player 0, posts first preflop)
+BB         = 2   # big blind  (Player 1, acts last preflop / first postflop)
 MAX_RAISES = 2
+STARTING_STACK = 100
 
-# Raise chip amounts: RAISE_AMOUNTS[round][size_index]
-RAISE_AMOUNTS = [
-    [2, 4, 6],   # Preflop: small=2, medium=4, large=6
-    [2, 4, 6],   # Flop
-    [4, 6, 8],   # Turn:   small=4, medium=6, large=8
-    [4, 6, 8],   # River
-]
+
+def get_raise_sizes(pot, call_amt):
+    """Return (small, medium, large) pot-relative raise sizes.
+
+    Raise size = additional chips above the call amount.
+    All sizes are at least BB to enforce a minimum meaningful raise.
+
+    Args:
+        pot:      current pot size in chips
+        call_amt: chips needed to call (0 when bets are equal = check)
+
+    Returns:
+        list of 3 ints: [small, medium, large] raise increments
+    """
+    pac = pot + call_amt   # pot-after-call
+    return [
+        max(BB, pac // 3),      # ~33% pot
+        max(BB, 2 * pac // 3),  # ~66% pot
+        max(BB, pac),           # 100% pot
+    ]
 
 # ---------------------------------------------------------------------------
 # Hand Evaluation
@@ -125,9 +145,9 @@ class RoyalState:
         self.community = deck[4:9]   # all 5 community cards (revealed progressively)
 
         self.round   = 0
-        self.pot     = ANTE * 2
-        self.stacks  = [100 - ANTE, 100 - ANTE]
-        self.bets    = [ANTE, ANTE]
+        self.pot     = SB + BB
+        self.stacks  = [STARTING_STACK - SB, STARTING_STACK - BB]
+        self.bets    = [SB, BB]
         self.to_act  = 0
         self.raises  = 0
         self.done    = False
@@ -149,9 +169,9 @@ class RoyalState:
         actions = [FOLD, CALL]
         if self.raises < MAX_RAISES:
             call_amt = self.bets[1 - self.to_act] - self.bets[self.to_act]
-            for i in range(3):
-                needed = call_amt + RAISE_AMOUNTS[self.round][i]
-                if self.stacks[self.to_act] >= needed:
+            raise_sizes = get_raise_sizes(self.pot, call_amt)
+            for i, rs in enumerate(raise_sizes):
+                if self.stacks[self.to_act] >= call_amt + rs:
                     actions.append(RAISE_S + i)
         return actions
 
@@ -183,10 +203,11 @@ class RoyalState:
                 return self
 
         else:
-            # RAISE_S / RAISE_M / RAISE_L
+            # RAISE_S / RAISE_M / RAISE_L — pot-relative sizing
             raise_idx = action - RAISE_S
-            bet       = RAISE_AMOUNTS[self.round][raise_idx]
             call_amt  = self.bets[opponent] - self.bets[player]
+            raise_sizes = get_raise_sizes(self.pot, call_amt)
+            bet       = raise_sizes[raise_idx]
             total     = min(call_amt + bet, self.stacks[player])
             self.stacks[player] -= total
             self.bets[player]   += total

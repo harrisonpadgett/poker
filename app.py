@@ -1,8 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 import poker_cpp
-from poker_env import RoyalState, N_ACTIONS, ACTION_NAMES, RAISE_AMOUNTS, FOLD
+from poker_env import RoyalState, N_ACTIONS, ACTION_NAMES, FOLD, get_raise_sizes
 from deep_cfr import DeepCFRTrainer, encode_state, ADV_SCALE
-from poker_env import RAISE_AMOUNTS
 import torch
 import numpy as np
 import random
@@ -43,11 +42,12 @@ def get_state_dict():
     call_amount = (current_state.bets[ai_player] - current_state.bets[human_player])
     call_amount = max(0, min(call_amount, current_state.stacks[human_player]))
 
-    rnd = min(current_state.round, 3)
+    # Pot-relative raise amounts (what the human would put in total for each raise)
+    raise_sizes = get_raise_sizes(current_state.pot, call_amount)
     raise_amounts = {
-        'raise_amount_s': call_amount + RAISE_AMOUNTS[rnd][0],
-        'raise_amount_m': call_amount + RAISE_AMOUNTS[rnd][1],
-        'raise_amount_l': call_amount + RAISE_AMOUNTS[rnd][2],
+        'raise_amount_s': call_amount + raise_sizes[0],
+        'raise_amount_m': call_amount + raise_sizes[1],
+        'raise_amount_l': call_amount + raise_sizes[2],
     }
 
     return {
@@ -66,6 +66,7 @@ def get_state_dict():
         "private":        private_strs,
         "ai_private":     ai_strs,
         "call_amount":    call_amount,
+        "is_check":       call_amount == 0,   # True → label button "Check" not "Call"
         "legal_actions":  current_state.legal_actions(),
         "history":        current_state.history,
         "is_human_turn":  current_state.to_act == human_player and not current_state.done,
