@@ -513,6 +513,71 @@ class DeepCFRTrainer:
         if losses:
             self.strat_loss = float(np.mean(losses))
 
+    def train_strat_network_final(self, n_steps=2000):
+        """Heavy final strategy training pass — run once on shutdown.
+
+        Runs n_steps gradient steps per round (vs 100 in the periodic version)
+        using the full DCFR-weighted buffer accumulated during training.
+        Prints per-round progress so the user can see it working.
+
+        This produces a much higher-quality strategy network than the periodic
+        lightweight updates, at the cost of ~30–60 seconds of shutdown time.
+        """
+        print(f"  Final strategy training: {n_steps} steps × {N_ROUNDS} rounds")
+        losses = []
+        for rnd in range(N_ROUNDS):
+            buf = self.strat_buffers[rnd]
+            n   = len(buf)
+            if n < 64:
+                print(f"    Round {rnd}: buffer too small ({n}), skipping.")
+                continue
+
+            B = min(n, 4096)
+
+            # Full momentum reset before a long training run.
+            for state in self.strat_opts[rnd].state.values():
+                if 'exp_avg' in state:
+                    state['exp_avg'].zero_()
+                if 'step' in state:
+                    state['step'] = state['step'] * 0
+
+            self.strat_nets[rnd].train()
+            recent_losses = []
+            LOG_EVERY = max(1, n_steps // 10)  # print ~10 progress lines per round
+
+            for step_i in range(n_steps):
+                states, targets, weights = buf.sample(B)
+                states  = states.to(self.device)
+                targets = targets.to(self.device)
+                weights = (weights * (B / weights.sum())).to(self.device)
+
+                preds     = self.strat_nets[rnd](states)
+                log_probs = F.log_softmax(preds, dim=1)
+                loss      = -(weights * (targets * log_probs).sum(dim=1)).mean()
+
+                self.strat_opts[rnd].zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.strat_nets[rnd].parameters(), max_norm=1.0
+                )
+                self.strat_opts[rnd].step()
+
+                if step_i >= n_steps - 200:
+                    recent_losses.append(loss.item())
+
+                if step_i % LOG_EVERY == 0 or step_i == n_steps - 1:
+                    print(f"    Round {rnd}  step {step_i+1:>4}/{n_steps}  loss={loss.item():.4f}")
+
+            if recent_losses:
+                rnd_loss = float(np.mean(recent_losses))
+                losses.append(rnd_loss)
+                self.strat_schedulers[rnd].step(rnd_loss)
+                print(f"    Round {rnd}: final avg loss = {rnd_loss:.4f}")
+
+        if losses:
+            self.strat_loss = float(np.mean(losses))
+            print(f"  Strategy training complete. Mean loss: {self.strat_loss:.4f}")
+
     # -------------------------------------------------------------------------
     # C++ interface helpers
     # -------------------------------------------------------------------------
@@ -604,7 +669,7 @@ class DeepCFRTrainer:
             future = self._submit_traversals(k_traversals, t)
             self.train_adv_network()
 
-            if self.iterations % 25 == 0:
+            if self.iterations % 100 == 0:
                 self.train_strat_network()
 
             self._sync_counts(future.result())
