@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import poker_cpp
 from poker_env import RoyalState, N_ACTIONS, ACTION_NAMES, FOLD, get_raise_sizes
@@ -7,10 +7,9 @@ import torch
 import numpy as np
 import random
 import os
-import json as _json
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
-CORS(app)  # Enable CORS for all routes
+app = Flask(__name__)
+CORS(app)
 
 # ---------------------------------------------------------------------------
 # AI initialisation
@@ -19,10 +18,10 @@ print("Loading Deep CFR AI...")
 trainer = DeepCFRTrainer(adv_buffer_size=10, strat_buffer_size=10)
 
 if os.path.exists('inference_checkpoint.pt'):
-    print("Found inference_checkpoint.pt (small size). Loading...")
+    print("Found inference_checkpoint.pt. Loading...")
     trainer.load_checkpoint('inference_checkpoint.pt')
 elif os.path.exists('checkpoint.pt'):
-    print("Found checkpoint.pt (full size). Loading...")
+    print("Found checkpoint.pt. Loading...")
     trainer.load_checkpoint('checkpoint.pt')
 else:
     print("WARNING: No checkpoint found! AI will play completely randomly.")
@@ -73,11 +72,11 @@ def get_state_dict():
         "private":        private_strs,
         "ai_private":     ai_strs,
         "call_amount":    call_amount,
-        "is_check":       call_amount == 0,   # True → label button "Check" not "Call"
+        "is_check":       call_amount == 0,
         "legal_actions":  current_state.legal_actions(),
         "history":        current_state.history,
         "is_human_turn":  current_state.to_act == human_player and not current_state.done,
-        "last_ai_move":   _last_ai_move,   # ← Intelligence Panel data
+        "last_ai_move":   _last_ai_move,
         **raise_amounts,
     }
 
@@ -91,31 +90,29 @@ def ai_play_turn():
     ai_player = 1 - human_player
     legal     = current_state.legal_actions()
 
-    # --- Strategy: Strategy Network (Learned Nash Equilibrium) ---
+    # Strategy Network — Learned Nash Equilibrium
     t     = encode_state(current_state, ai_player)
     probs = trainer.get_average_strategy_from_tensor(t, legal, current_state.round)
 
-    # --- Advantages: raw neural network output (what the "Brain" sees) ---
+    # Advantage Network — raw output for the Intelligence Panel
     try:
         with torch.no_grad():
-            t_enc   = encode_state(current_state, ai_player)
             adv_raw = trainer.adv_nets[ai_player][current_state.round](
-                t_enc.to(trainer.device).unsqueeze(0)
+                t.to(trainer.device).unsqueeze(0)
             ).squeeze(0).cpu().numpy() * ADV_SCALE
         advantages = [round(float(adv_raw[i]), 3) for i in range(N_ACTIONS)]
     except Exception:
         advantages = [0.0] * N_ACTIONS
 
-    # --- Sample action from strategy distribution ---
+    # Sample action from strategy distribution
     p = np.array([probs[a] for a in legal], dtype=np.float64)
     if p.sum() == 0:
         p = np.ones_like(p) / len(p)
     else:
         p /= p.sum()
 
-    action      = int(np.random.choice(legal, p=p))
-    action_names = ['Fold', 'Call', 'Raise-S', 'Raise-M', 'Raise-L']
-    print(f"AI plays {action_names[action]} | "
+    action = int(np.random.choice(legal, p=p))
+    print(f"AI plays {ACTION_NAMES[action]} | "
           f"F={probs[0]:.2f} C={probs[1]:.2f} "
           f"RS={probs[2]:.2f} RM={probs[3]:.2f} RL={probs[4]:.2f}")
 
@@ -123,7 +120,6 @@ def ai_play_turn():
     current_state.apply_action(action)
     chips_pushed = ai_stack_before - current_state.stacks[ai_player]
 
-    # Store for Intelligence Panel
     _last_ai_move = {
         'action':       action,
         'probs':        [round(float(probs[i]), 4) for i in range(N_ACTIONS)],
@@ -136,28 +132,9 @@ def ai_play_turn():
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
-last_checkpoint_mtime = 0
-
-def check_and_reload_model():
-    global last_checkpoint_mtime
-    target_file = 'inference_checkpoint.pt' if os.path.exists('inference_checkpoint.pt') else 'checkpoint.pt'
-    if os.path.exists(target_file):
-        mtime = os.path.getmtime(target_file)
-        if mtime > last_checkpoint_mtime:
-            print(f"New {target_file} detected! Reloading AI model...")
-            trainer.load_checkpoint(target_file)
-            last_checkpoint_mtime = mtime
-
-
 @app.route('/api/start', methods=['POST'])
 def start_game():
     global current_state, human_player, _last_ai_move
-    check_and_reload_model()
 
     seed = random.randint(0, 1_000_000)
     current_state = poker_cpp.RoyalState()
@@ -196,21 +173,6 @@ def take_action():
         ai_play_turn()
 
     return jsonify(get_state_dict())
-
-
-@app.route('/api/training_stats', methods=['GET'])
-def training_stats():
-    """Lightweight stats from stats.json (written by train_terminal.py every 100 iters)."""
-    try:
-        with open('stats.json', 'r') as f:
-            return jsonify(_json.load(f))
-    except Exception:
-        # Fallback: use whatever is loaded in memory
-        return jsonify({
-            'iterations': trainer.iterations,
-            'adv_loss':   float(trainer.adv_loss),
-            'strat_loss': float(trainer.strat_loss),
-        })
 
 
 if __name__ == '__main__':
