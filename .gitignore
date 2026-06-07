@@ -7,6 +7,7 @@ __pycache__/
 *.pth
 checkpoint.pt
 *.tmp.pt
+!inference_checkpoint.pt
 
 # C++ Build artifacts
 build/
@@ -17,6 +18,16 @@ build/
 # Logs
 *.log
 
+# Training Stats
+stats.json
+
+# Agents
+.claude/
+
 # IDEs
 .vscode/
 .idea/
+
+# Helpers
+train_overnight.sh
+strip_checkpoint.py

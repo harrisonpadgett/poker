@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
 import poker_cpp
 from poker_env import RoyalState, N_ACTIONS, ACTION_NAMES, FOLD, get_raise_sizes
 from deep_cfr import DeepCFRTrainer, encode_state, ADV_SCALE
@@ -9,16 +10,22 @@ import os
 import json as _json
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
+CORS(app)  # Enable CORS for all routes
 
 # ---------------------------------------------------------------------------
 # AI initialisation
 # ---------------------------------------------------------------------------
 print("Loading Deep CFR AI...")
 trainer = DeepCFRTrainer(adv_buffer_size=10, strat_buffer_size=10)
-if os.path.exists('checkpoint.pt'):
+
+if os.path.exists('inference_checkpoint.pt'):
+    print("Found inference_checkpoint.pt (small size). Loading...")
+    trainer.load_checkpoint('inference_checkpoint.pt')
+elif os.path.exists('checkpoint.pt'):
+    print("Found checkpoint.pt (full size). Loading...")
     trainer.load_checkpoint('checkpoint.pt')
 else:
-    print("WARNING: checkpoint.pt not found! AI will play completely randomly.")
+    print("WARNING: No checkpoint found! AI will play completely randomly.")
 
 # Game state
 current_state = None
@@ -138,11 +145,12 @@ last_checkpoint_mtime = 0
 
 def check_and_reload_model():
     global last_checkpoint_mtime
-    if os.path.exists('checkpoint.pt'):
-        mtime = os.path.getmtime('checkpoint.pt')
+    target_file = 'inference_checkpoint.pt' if os.path.exists('inference_checkpoint.pt') else 'checkpoint.pt'
+    if os.path.exists(target_file):
+        mtime = os.path.getmtime(target_file)
         if mtime > last_checkpoint_mtime:
-            print("New checkpoint detected! Reloading AI model...")
-            trainer.load_checkpoint('checkpoint.pt')
+            print(f"New {target_file} detected! Reloading AI model...")
+            trainer.load_checkpoint(target_file)
             last_checkpoint_mtime = mtime
 
 
