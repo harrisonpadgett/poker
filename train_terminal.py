@@ -86,13 +86,6 @@ def main():
             status_msg = ""
             if i % 50 == 0:
                 trainer.save_checkpoint('checkpoint.pt', verbose=False)
-                # Write lightweight stats for the web app to read
-                with open('stats.json', 'w') as _sf:
-                    json.dump({
-                        'iterations': trainer.iterations,
-                        'adv_loss':   float(trainer.adv_loss),
-                        'strat_loss': float(trainer.strat_loss),
-                    }, _sf)
                 status_msg = "[+] Checkpoint saved"
 
             adv_loss   = f"{trainer.adv_loss:.4f}"  if trainer.adv_loss  else "0.0000"

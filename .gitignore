@@ -18,9 +18,6 @@ build/
 # Logs
 *.log
 
-# Training Stats
-stats.json
-
 # Agents
 .claude/
 

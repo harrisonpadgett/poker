@@ -1,16 +1,14 @@
 # Royal Hold'em Deep CFR Poker AI
 
-A heads-up (two-player) poker AI for **Royal Hold'em** that learns a near-optimal strategy from scratch using **Deep Counterfactual Regret Minimization (Deep CFR)**. No human poker knowledge is baked in — the AI discovers correct strategy entirely through self-play against itself.
-
-The same algorithmic family powers **Libratus** and **Pluribus** — the AI systems that defeated world-champion poker professionals in 2017 and 2019.
+A heads-up (two-player) poker AI for **Royal Hold'em** that learns a near-optimal strategy from scratch using **Deep Counterfactual Regret Minimization (Deep CFR)**. No human poker knowledge is baked in,the AI discovers correct strategy entirely through self-play against itself.
 
 ---
 
 ## Gameplay
 
-![Web UI screenshot — Preflop betting round. The player holds K♦ A♠. The AI Intelligence Panel on the right explains the AI made a Small Bet; the Nash Strategy Distribution shows Call and Raise-S as the most probable actions, supported by the Neural Network Output predicting +0.0 chip advantage for those moves.](docs/game_screenshot.png)
+![Gameplay during the preflop betting round. The player holds K♣ A♠. The AI Intelligence Panel on the right explains the AI made a small bet; the Nash Strategy Distribution shows Call and Raise-S as the most probable actions, supported by the Neural Network Output predicting +0.0 chip advantage for those moves.](docs/game_screenshot.png)
 
-*The sleek new web interface mid-hand during the Preflop betting round. The player holds K♦ A♠ facing a small bet from the AI. The right-hand **AI Intelligence Panel** exposes the AI's full internal reasoning: the strategy network assigned nearly equal probability to calling or raising small, and the advantage network (the "Brain") confirms both actions yield a neutral chip advantage over the alternatives.*
+*Gameplay during the preflop betting round. The player holds K♣ A♠ facing a small bet from the AI. The right-hand **AI Intelligence Panel** exposes the AI's full internal reasoning: the strategy network assigned nearly equal probability to calling or raising small, and the advantage network (the "Brain") confirms both actions yield a neutral chip advantage over the alternatives.*
 
 ---
 
@@ -75,12 +73,16 @@ Training runs up to 100,000 iterations, hot-saving to `checkpoint.pt` every 100 
 
 ## Playing Against the AI
 
+You can play against the trained AI live at **[hpadgett.com/poker](https://hpadgett.com/poker)**.
+
+Alternatively, you can host it locally. The local web UI hot-reloads `checkpoint.pt`, so you can play against the AI while it actively trains in a separate terminal:
+
 ```bash
 python3 app.py
 # Opens http://localhost:5001
 ```
 
-The web UI hot-reloads `checkpoint.pt`, so you can play against the AI while it actively trains in a separate terminal. The Intelligence Panel exposes the exact probabilities and chip advantages the neural networks are calculating in real-time.
+The Intelligence Panel exposes the exact probabilities and chip advantages the neural networks are calculating in real-time.
 
 ---
 

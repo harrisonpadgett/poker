@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import poker_cpp
 from poker_env import RoyalState, N_ACTIONS, ACTION_NAMES, FOLD, get_raise_sizes
@@ -131,6 +131,9 @@ def ai_play_turn():
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+@app.route('/')
+def index():
+    return render_template('index.html')
 
 @app.route('/api/start', methods=['POST'])
 def start_game():
