@@ -412,68 +412,84 @@ class DeepCFRTrainer:
     # Training
     # -------------------------------------------------------------------------
     def train_adv_network(self):
-        """Train all 8 advantage networks (player × round)."""
-        losses = []
-        for player in range(2):
-            for rnd in range(N_ROUNDS):
-                buf = self.adv_buffers[player][rnd]
-                n   = len(buf)
-                if n < 64:
-                    continue
+        """Train all 8 advantage networks (player × round) in parallel."""
+        from concurrent.futures import ThreadPoolExecutor
 
-                B = min(n, 4096)
+        # Restrict PyTorch to 1 thread internally so our 8 network threads 
+        # don't thrash the CPU with context switching overhead.
+        original_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
 
-                # Warm restart every 1,000 iterations to escape local minima.
-                if self.iterations % 1000 == 0:
-                    self.adv_nets[player][rnd] = DeepCFRNetwork().to(self.device)
-                    self.adv_opts[player][rnd] = torch.optim.AdamW(
-                        self.adv_nets[player][rnd].parameters(),
-                        lr=0.001, weight_decay=1e-4
-                    )
-                    steps = 500
-                    # LR warmup: first 10 steps at low lr so AdamW's moment
-                    # estimates stabilise before the full rate kicks in.
-                    WARMUP_STEPS = 10
-                    WARMUP_LR    = 0.0001
+        def _train_single_net(player, rnd):
+            buf = self.adv_buffers[player][rnd]
+            n   = len(buf)
+            if n < 64:
+                return None
+
+            B = min(n, 4096)
+
+            if self.iterations % 1000 == 0:
+                self.adv_nets[player][rnd] = DeepCFRNetwork().to(self.device)
+                self.adv_opts[player][rnd] = torch.optim.AdamW(
+                    self.adv_nets[player][rnd].parameters(),
+                    lr=0.001, weight_decay=1e-4
+                )
+                steps = 500
+                WARMUP_STEPS = 10
+                WARMUP_LR    = 0.0001
+            else:
+                if n < 10_000:
+                    steps = 20
+                elif n < 100_000:
+                    steps = 40
                 else:
-                    # Adaptive steps: scale with buffer richness.
-                    # Small buffer → fewer steps (avoid overfitting on repeated
-                    # samples). Large buffer → more steps (exploit the rich data).
-                    # Max is 60, not 100 — keeps training time ~equal to the old
-                    # 75-step baseline so RBP traversal savings actually show up.
-                    if n < 10_000:
-                        steps = 20
-                    elif n < 100_000:
-                        steps = 40
-                    else:
-                        steps = 60
-                    WARMUP_STEPS = 0
-                    WARMUP_LR    = 0.001  # unused
+                    steps = 60
+                WARMUP_STEPS = 0
+                WARMUP_LR    = 0.001  # unused
 
-                self.adv_nets[player][rnd].train()
-                opt = self.adv_opts[player][rnd]
-                for step_i in range(steps):
-                    # Apply warmup LR for the first WARMUP_STEPS steps.
-                    if step_i == 0 and WARMUP_STEPS > 0:
-                        for pg in opt.param_groups: pg['lr'] = WARMUP_LR
-                    elif step_i == WARMUP_STEPS and WARMUP_STEPS > 0:
-                        for pg in opt.param_groups: pg['lr'] = 0.001
-                    states, targets, weights = buf.sample(B)
-                    states  = states.to(self.device)
-                    targets = targets.to(self.device) / ADV_SCALE
-                    weights = (weights * (B / weights.sum())).to(self.device)
+            self.adv_nets[player][rnd].train()
+            opt = self.adv_opts[player][rnd]
+            
+            final_loss = None
+            for step_i in range(steps):
+                if step_i == 0 and WARMUP_STEPS > 0:
+                    for pg in opt.param_groups: pg['lr'] = WARMUP_LR
+                elif step_i == WARMUP_STEPS and WARMUP_STEPS > 0:
+                    for pg in opt.param_groups: pg['lr'] = 0.001
+                    
+                states, targets, weights = buf.sample(B)
+                states  = states.to(self.device)
+                targets = targets.to(self.device) / ADV_SCALE
+                weights = (weights * (B / weights.sum())).to(self.device)
 
-                    preds = self.adv_nets[player][rnd](states)
-                    loss  = (weights * ((preds - targets) ** 2).sum(dim=1)).mean()
+                preds = self.adv_nets[player][rnd](states)
+                loss  = (weights * ((preds - targets) ** 2).sum(dim=1)).mean()
 
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        self.adv_nets[player][rnd].parameters(), max_norm=1.0
-                    )
-                    opt.step()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.adv_nets[player][rnd].parameters(), max_norm=1.0
+                )
+                opt.step()
+                final_loss = loss.item() * (ADV_SCALE ** 2)
 
-                losses.append(loss.item() * (ADV_SCALE ** 2))
+            return final_loss
+
+        losses = []
+        # Cloud Optimization: Limit to 4 parallel networks so the C++ engine 
+        # can use the other 4 cores without fighting the hypervisor.
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for player in range(2):
+                for rnd in range(N_ROUNDS):
+                    futures.append(executor.submit(_train_single_net, player, rnd))
+            
+            for f in futures:
+                res = f.result()
+                if res is not None:
+                    losses.append(res)
+                    
+        torch.set_num_threads(original_threads)
 
         if losses:
             self.adv_loss = float(np.mean(losses))

@@ -13,18 +13,19 @@ takes proportionally longer but keeps the machine cooler and quieter.
   'low'    — 2 threads,     250 traversals/iter  (~3–5s/iter, cool & quiet)
 """
 
-EFFORT = 'medium-high'
+EFFORT = 'cloud'
 
 # ─── effort → hardware settings ────────────────────────────────────────────
 _EFFORT_CONFIGS = {
     #                   threads  k_trav  sleep_s
+    'cloud':       (4,       800,    0.2),   # Limits C++ to 4 cores, gives 0.2s pause
     'high':        (0,       800,    0.0),   # 0 threads = use all hardware cores
     'medium-high': (6,       650,    0.1),   # 6 threads, brief pause to avoid overheating
     'medium':      (4,       500,    0.0),
     'low':         (2,       250,    0.5),   # 0.5s breathing room between iters
 }
 if EFFORT not in _EFFORT_CONFIGS:
-    raise ValueError(f"EFFORT must be 'high', 'medium-high', 'medium', or 'low'. Got: {EFFORT!r}")
+    raise ValueError(f"EFFORT must be 'cloud', 'high', 'medium-high', 'medium', or 'low'. Got: {EFFORT!r}")
 _N_THREADS, _K_TRAVERSALS, _SLEEP = _EFFORT_CONFIGS[EFFORT]
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ def main():
     try:
         start_time = time.time()
         start_iter = trainer.iterations + 1
-        for i in range(start_iter, 100_001):
+        for i in range(start_iter, 500_001):
             trainer.train(n_iterations=1, k_traversals=_K_TRAVERSALS)
 
             if _SLEEP > 0:
@@ -110,7 +111,7 @@ def main():
                 print("\033[10A", end="")
 
             elapsed   = time.time() - start_time
-            remaining = elapsed * (100_000 - i)
+            remaining = elapsed * (500_000 - i)
 
             print(f"Elapsed: {elapsed:.2f}s  ETA: {remaining:.0f}s\033[K")
             print(f"{i:<6} | {adv_loss:>10} | {strat_loss:>10}\033[K")
