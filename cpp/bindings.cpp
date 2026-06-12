@@ -36,6 +36,7 @@ static cblas_sgemv_t cblas_sgemv_ptr = nullptr;
 void init_blas() {
     void* handle = dlopen("@rpath/libBLAS.dylib", RTLD_NOLOAD);
     if (!handle) handle = dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", RTLD_NOLOAD);
+    if (!handle) handle = dlopen("libopenblas.so.0", RTLD_LAZY);
     if (!handle) return;
     cblas_sgemv_ptr = (cblas_sgemv_t)dlsym(handle, "cblas_sgemv");
 }
@@ -363,13 +364,17 @@ py::dict run_traversals(
         };
     }
 
-    // Phase 1: parallel traversal, no locks
-    int n_threads = (g_num_threads > 0)
-        ? std::min(g_num_threads, (int)std::thread::hardware_concurrency())
-        : std::max(1, (int)std::thread::hardware_concurrency());
-    std::vector<std::vector<LocalSample>> per_thread(n_threads);
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
+    // Release the Python GIL so the main thread can train the neural network concurrently!
+    {
+        py::gil_scoped_release release;
+
+        // Phase 1: parallel traversal, no locks
+        int n_threads = (g_num_threads > 0)
+            ? std::min(g_num_threads, (int)std::thread::hardware_concurrency())
+            : std::max(1, (int)std::thread::hardware_concurrency());
+        std::vector<std::vector<LocalSample>> per_thread(n_threads);
+        std::vector<std::thread> threads;
+        threads.reserve(n_threads);
 
     int base_k = k_traversals / n_threads;
     int extra_k = k_traversals % n_threads;
@@ -391,14 +396,15 @@ py::dict run_traversals(
     }
     for (auto& th : threads) th.join();
 
-    // Phase 2: serial merge
-    std::mt19937 merge_rng(std::random_device{}());
-    for (auto& local : per_thread) {
-        for (const auto& s : local) {
-            if (s.buf_id <= 7) {
-                adv_bufs[s.buf_id].push(s.state, s.target, s.weight, merge_rng);
-            } else {
-                strat_bufs[s.buf_id - 8].push(s.state, s.target, s.weight, merge_rng);
+        // Phase 2: serial merge
+        std::mt19937 merge_rng(std::random_device{}());
+        for (auto& local : per_thread) {
+            for (const auto& s : local) {
+                if (s.buf_id <= 7) {
+                    adv_bufs[s.buf_id].push(s.state, s.target, s.weight, merge_rng);
+                } else {
+                    strat_bufs[s.buf_id - 8].push(s.state, s.target, s.weight, merge_rng);
+                }
             }
         }
     }
